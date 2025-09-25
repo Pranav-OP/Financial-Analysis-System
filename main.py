@@ -1,10 +1,8 @@
 # -----------------------------------------------------------------------------
 # Imports
 # -----------------------------------------------------------------------------
-import os
-import uuid
-import asyncio
-import shutil
+import os, io, csv, uuid, shutil
+from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from typing import Optional, List
@@ -14,11 +12,15 @@ from crewai import Crew
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 
 from models import (
     UserRegister, UserLogin, UserResponse, UserCreate, UserOut, Token,
@@ -127,22 +129,31 @@ def require_role(required_roles: List[str]):
         return user
     return role_checker
 
+# -----------------------------------------------------------------------------
+# DOCUMENT STAGING HELPERS
+# -----------------------------------------------------------------------------
 
-# async def get_current_user(token: str = Depends(oauth2_scheme)):
-#     payload = Depends.decode_jwt(token)
-#     return payload
-
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = "data"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-def stage_file_for_analysis(doc_id: str, filename: str) -> str:
-    """Copy file from data/ to uploads/ and return the staged path."""
-    source_path = f"data/{doc_id}_{filename}"
-    if not os.path.exists(source_path):
-        raise FileNotFoundError(f"File not found: {source_path}")
-    
+# init GridFS bucket 
+gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="documents")
+
+async def stage_file_for_analysis(doc_id: str, filename: str, gridfs_file_id: str) -> str:
+    """Fetch file from GridFS and save locally for analysis."""
+
     staged_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
-    shutil.copy(source_path, staged_path)
+
+    # Open GridFS download stream
+    download_stream = await gridfs_bucket.open_download_stream(ObjectId(gridfs_file_id))
+
+    with open(staged_path, "wb") as f:
+        while True:
+            chunk = await download_stream.readchunk()
+            if not chunk:
+                break
+            f.write(chunk)
+
     return staged_path
 
 def cleanup_staged_file(path: str):
@@ -219,6 +230,7 @@ async def get_current_user_info(current_user=Depends(get_current_user)):
         roles=current_user.get("roles", []),
         created_at=current_user.get("created_at")
     )
+
 # ------------------ DOCUMENTS ------------------
 
 @app.post("/documents/upload", response_model=DocumentMeta)
@@ -227,17 +239,22 @@ async def upload_document(
     current_user=Depends(require_role(["analyst", "admin"]))
 ):
     """Upload a financial document (PDF, DOCX, XLSX, CSV, Image)"""
-    file_id = str(uuid.uuid4())
-    file_path = f"data/{file_id}_{file.filename}"
-    os.makedirs("data", exist_ok=True)
 
+    file_id = str(uuid.uuid4())
     content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
+
+    # file_path = f"data/{file_id}_{file.filename}"
+    # os.makedirs("data", exist_ok=True)
+    # with open(file_path, "wb") as f:
+    #     f.write(content)
+
+    # Save file into GridFS
+    gridfs_file_id = await gridfs_bucket.upload_from_stream(file.filename, content)
 
     doc = {
         "_id": file_id,
         "filename": file.filename,
+        "gridfs_file_id": str(gridfs_file_id),
         "uploader_id": current_user["_id"],
         "size_bytes": len(content),
         "status": "uploaded",
@@ -256,59 +273,71 @@ async def upload_document(
 
 
 @app.get("/documents", response_model=List[DocumentMeta])
-async def list_documents(current_user=Depends(get_current_user)):
-    """List all documents uploaded by the current user"""
-
-    query_filter = {}  
+async def list_documents(
+    page: int = 1,
+    limit: int = 20,
+    q: str = None,
+    current_user=Depends(get_current_user),
+):
+    query_filter = {}
     if "admin" not in current_user.get("roles", []):
         query_filter = {"uploader_id": current_user["_id"]}
+    if q:
+        query_filter["filename"] = {"$regex": q, "$options": "i"}
 
-    #cursor = db.documents.find({"uploader_id": current_user["_id"]}).sort("created_at", -1)
-    cursor = db.documents.find(query_filter).sort("created_at", -1)
-    docs = await cursor.to_list(100)
+    cursor = (
+        db.documents.find(query_filter)
+        .sort("created_at", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(limit)
 
-    return [
-        DocumentMeta(
-            id=d["_id"],
-            filename=d["filename"],
-            status=d["status"],
-            size_bytes=d["size_bytes"],
-            uploader_id=d["uploader_id"],
-            created_at=d["created_at"],
-        )
-        for d in docs
-    ]
+    return [DocumentMeta(
+        id=d["_id"],
+        filename=d["filename"],
+        status=d["status"],
+        size_bytes=d["size_bytes"],
+        uploader_id=d["uploader_id"],
+        created_at=d["created_at"],
+    ) for d in docs]
 
+
+@app.get("/documents/{doc_id}/download")
+async def download_document(doc_id: str, current_user=Depends(get_current_user)):
+    doc = await db.documents.find_one({"_id": doc_id})
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    if "admin" not in current_user.get("roles", []) and doc["uploader_id"] != current_user["_id"]:
+        raise HTTPException(403, "Forbidden")
+
+    grid_out = await gridfs_bucket.open_download_stream(ObjectId(doc["gridfs_file_id"]))
+
+    async def file_iterator():
+        while chunk := await grid_out.readchunk():
+            yield chunk
+
+    return StreamingResponse(
+        file_iterator(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={doc['filename']}"},
+    )
+
+
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str, current_user=Depends(get_current_user)):
+    doc = await db.documents.find_one({"_id": doc_id})
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    if "admin" not in current_user.get("roles", []) and doc["uploader_id"] != current_user["_id"]:
+        raise HTTPException(403, "Forbidden")
+
+    await gridfs_bucket.delete(ObjectId(doc["gridfs_file_id"]))
+    await db.documents.delete_one({"_id": doc_id})
+    await db.analyses.delete_many({"document_id": doc_id})  # cleanup analyses
+    return {"status": "deleted"}
 
 # ------------------ ANALYSES ------------------
-
-# @app.post("/analyses/{doc_id}", response_model=AnalysisResult)
-# async def request_analysis(doc_id: str, req: AnalysisRequest, token: str = Depends(oauth2_scheme)):
-#     user = decode_jwt(token)
-#     db = mongo_client[os.getenv("MONGO_DB")]
-
-#     doc = db.documents.find_one({"_id": ObjectId(doc_id), "user_id": user["id"]})
-#     if not doc:
-#         raise HTTPException(404, "Document not found")
-
-#     analysis = {
-#         "document_id": doc_id,
-#         "status": "queued",
-#         "query": req.query,
-#         "created_at": datetime.utcnow()
-#     }
-#     res = db.analyses.insert_one(analysis)
-
-#     # enqueue in Redis job queue
-#     enqueue_analysis_job(str(res.inserted_id), doc_id, req.query)
-
-#     return AnalysisResult(
-#         id=str(res.inserted_id),
-#         document_id=doc_id,
-#         status="queued",
-#         created_at=analysis["created_at"],
-#         query=req.query
-#     )
 
 @app.post("/analyses/{doc_id}", response_model=AnalysisResult)
 async def request_analysis(
@@ -331,7 +360,7 @@ async def request_analysis(
 
     # Stage file for analysis
     try:
-        staged_path = stage_file_for_analysis(doc_id, doc["filename"])
+        staged_path = await stage_file_for_analysis(doc_id, doc["filename"], doc["gridfs_file_id"])
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
 
@@ -340,6 +369,7 @@ async def request_analysis(
         result = crew.kickoff(
             inputs={"document_path": staged_path, "query": req.query}
         )
+
     except Exception as e:
         cleanup_staged_file(staged_path)
         raise HTTPException(500, f"Analysis failed: {str(e)}")
@@ -361,6 +391,7 @@ async def request_analysis(
         "investment_insights": result.output.get("investment_insights", []) if hasattr(result, "output") else [],
         "risk_assessment": result.output.get("risk_assessment", []) if hasattr(result, "output") else [],
         "raw_excerpt": result.raw if hasattr(result, "raw") else None,
+        #"confidence": result.output.get("confidence", 0.0),
         "created_at": datetime.utcnow(),
         "completed_at": datetime.utcnow()
     }
@@ -387,7 +418,7 @@ async def get_analysis(analysis_id: str):
     # if cache:
     #     return AnalysisResult(**cache)
 
-    db = mongo_client[os.getenv("MONGO_DB")]
+    db = mongo_client[DB_NAME]
     analysis = db.analyses.find_one({"_id": ObjectId(analysis_id)})
     if not analysis:
         raise HTTPException(404, "Analysis not found")
@@ -409,6 +440,56 @@ async def get_analysis(analysis_id: str):
     # set_cache(f"analysis:{analysis_id}", result.dict())
     return result
 
+
+@app.get("/analyses", response_model=List[AnalysisResult])
+async def list_analyses(
+    document_id: str = None,
+    current_user=Depends(get_current_user),
+):
+    query = {}
+    if document_id:
+        query["document_id"] = document_id
+    if "admin" not in current_user.get("roles", []):
+        query["uploader_id"] = current_user["_id"]
+
+    cursor = db.analyses.find(query).sort("created_at", -1)
+    analyses = await cursor.to_list(100)
+    return [AnalysisResult(**a, id=a["_id"]) for a in analyses]
+
+# ------------------ EXPORT ------------------
+
+@app.get("/analyses/{analysis_id}/export")
+async def export_analysis(analysis_id: str, format: str = "pdf", current_user=Depends(get_current_user)):
+    analysis = await db.analyses.find_one({"_id": analysis_id})
+    if not analysis:
+        raise HTTPException(404, "Analysis not found")
+
+    if format == "pdf":
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer)
+        styles = getSampleStyleSheet()
+        story = [
+            Paragraph(f"Query: {analysis['query']}", styles["Normal"]),
+            Paragraph(f"Summary: {analysis['summary']}", styles["BodyText"]),
+        ]
+        doc.build(story)
+        buffer.seek(0)
+        return StreamingResponse(buffer, media_type="application/pdf", headers={
+            "Content-Disposition": f"attachment; filename=analysis_{analysis_id}.pdf"
+        })
+    
+    elif format == "csv":
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["Query", "Summary"])
+        writer.writerow([analysis["query"], analysis["summary"]])
+        buffer.seek(0)
+        return StreamingResponse(io.BytesIO(buffer.read().encode()), media_type="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=analysis_{analysis_id}.csv"
+        })
+    
+    else:
+        raise HTTPException(400, "Unsupported format")
 
 # -----------------------------------------------------------------------------
 # ENTRYPOINT

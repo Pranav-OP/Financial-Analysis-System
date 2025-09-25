@@ -12,36 +12,35 @@ import {
     Paper,
     LinearProgress,
     Alert,
+    Card,
+    CardContent,
+    Divider,
+    Chip,
+    Stack,
 } from "@mui/material";
 import api from "../api/axios";
 
 function Dashboard() {
     const [documents, setDocuments] = useState([]);
+    const [analyses, setAnalyses] = useState([]);
     const [selectedFile, setSelectedFile] = useState(null);
-    const [query, setQuery] = useState(
-        "Analyze this financial document for investment insights"
-    );
+    const [query, setQuery] = useState("Analyze this financial document for investment insights");
     const [loading, setLoading] = useState(false);
     const [analysisResults, setAnalysisResults] = useState({});
     const [error, setError] = useState("");
-    const [user, setUser] = useState(null); // <-- user info
+    const [user, setUser] = useState(null);
 
     useEffect(() => {
-        // fetchUser();
         if (localStorage.getItem("access_token")) {
             fetchUser();
         }
         fetchDocuments();
+        fetchAnalyses();
     }, []);
 
-    // Fetch current user to determine roles
     const fetchUser = async () => {
         try {
-            // const token = localStorage.getItem("access_token");
-            // const res = await api.get("/auth/me", {
-            //     headers: { Authorization: `Bearer ${token}` },
-            // });
-            const res = await api.get("/auth/me"); // interceptor adds token automatically
+            const res = await api.get("/auth/me");
             setUser(res.data);
         } catch (err) {
             console.error(err);
@@ -56,6 +55,16 @@ function Dashboard() {
         } catch (err) {
             console.error(err);
             setError("Failed to fetch documents.");
+        }
+    };
+
+    const fetchAnalyses = async () => {
+        try {
+            const res = await api.get("/analyses");
+            setAnalyses(res.data);
+        } catch (err) {
+            console.error(err);
+            setError("Failed to fetch analyses.");
         }
     };
 
@@ -90,6 +99,7 @@ function Dashboard() {
         try {
             const res = await api.post(`/analyses/${docId}`, { query });
             setAnalysisResults((prev) => ({ ...prev, [docId]: res.data }));
+            fetchAnalyses();
         } catch (err) {
             console.error(err);
             setError("Analysis failed.");
@@ -98,8 +108,60 @@ function Dashboard() {
         }
     };
 
+    const handleDelete = async (docId) => {
+        if (!window.confirm("Are you sure you want to delete this document?")) return;
+        try {
+            await api.delete(`/documents/${docId}`);
+            fetchDocuments();
+        } catch (err) {
+            console.error(err);
+            setError("Delete failed.");
+        }
+    };
+
+    const handleDownload = async (docId, filename) => {
+        try {
+            const res = await api.get(`/documents/${docId}/download`, {
+                responseType: "blob", // important for binary data
+            });
+
+            // create a link and click it programmatically
+            const url = window.URL.createObjectURL(new Blob([res.data]));
+            const link = document.createElement("a");
+            link.href = url;
+            link.setAttribute("download", filename || `document_${docId}.pdf`);
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        } catch (err) {
+            console.error(err);
+            alert("Download failed.");
+        }
+    };
+
+
+    const handleExport = async (analysisId, filename = "analysis_export.pdf") => {
+        try {
+            const res = await api.get(`/analyses/${analysisId}/export`, {
+                responseType: "blob",
+            });
+
+            const url = window.URL.createObjectURL(new Blob([res.data]));
+            const link = document.createElement("a");
+            link.href = url;
+            link.setAttribute("download", filename);
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        } catch (err) {
+            console.error(err);
+            alert("Export failed.");
+        }
+    };
+
+
     const canUpload = user?.roles.includes("analyst") || user?.roles.includes("admin");
-    const canAnalyze = canUpload; // same roles can request analysis
+    const canAnalyze = canUpload;
 
     // helper to safely parse summary if it's JSON inside code block
     const parseSummary = (summary) => {
@@ -149,6 +211,9 @@ function Dashboard() {
             {loading && <LinearProgress sx={{ mb: 2 }} />}
 
             {/* Documents Table */}
+            <Typography variant="h6" sx={{ mt: 3, mb: 1 }}>
+                Documents
+            </Typography>
             <Paper>
                 <Table>
                     <TableHead>
@@ -156,7 +221,7 @@ function Dashboard() {
                             <TableCell>Filename</TableCell>
                             <TableCell>Size</TableCell>
                             <TableCell>Status</TableCell>
-                            {canAnalyze && <TableCell>Actions</TableCell>}
+                            <TableCell>Actions</TableCell>
                         </TableRow>
                     </TableHead>
                     <TableBody>
@@ -165,16 +230,21 @@ function Dashboard() {
                                 <TableCell>{doc.filename}</TableCell>
                                 <TableCell>{(doc.size_bytes / 1024).toFixed(2)} KB</TableCell>
                                 <TableCell>{doc.status}</TableCell>
-                                {canAnalyze && (
-                                    <TableCell>
-                                        <Button
-                                            variant="outlined"
-                                            onClick={() => runAnalysis(doc.id)}
-                                        >
-                                            Analyze
+                                <TableCell>
+                                    <Stack direction="row" spacing={1}>
+                                        <Button variant="outlined" onClick={() => handleDownload(doc.id, doc.filename)}>
+                                            Download
                                         </Button>
-                                    </TableCell>
-                                )}
+                                        {canAnalyze && (
+                                            <Button variant="outlined" onClick={() => runAnalysis(doc.id)}>
+                                                Analyze
+                                            </Button>
+                                        )}
+                                        <Button variant="outlined" color="error" onClick={() => handleDelete(doc.id)}>
+                                            Delete
+                                        </Button>
+                                    </Stack>
+                                </TableCell>
                             </TableRow>
                         ))}
                     </TableBody>
@@ -185,24 +255,103 @@ function Dashboard() {
             {Object.keys(analysisResults).length > 0 && (
                 <Box sx={{ mt: 4 }}>
                     <Typography variant="h5" gutterBottom>
-                        Analysis Results
+                        Latest Analysis Results
                     </Typography>
-                    {Object.entries(analysisResults).map(([docId, result]) => (
-                        <Paper key={docId} sx={{ p: 2, my: 1 }}>
-                            <Typography variant="subtitle1">{result.document_id}</Typography>
-                            <Typography>Status: <br/>{result.status}</Typography>
-                            <Typography>Summary: <br/>{result.summary}</Typography>
-                            <Typography>
-                                Investment Insights:<br/>{" "}
-                                {result.investment_insights.join(", ") || "None"}
-                            </Typography>
-                            <Typography>
-                                Risk Assessment: <br/>{result.risk_assessment.join(", ") || "None"}
-                            </Typography>
-                        </Paper>
-                    ))}
+                    {Object.entries(analysisResults).map(([docId, result]) => {
+                        const parsedSummary = parseSummary(result.summary);
+                        return (
+                            <Card key={docId} sx={{ mb: 2 }}>
+                                <CardContent>
+                                    <Typography variant="h6" gutterBottom>
+                                        Document ID: {result.document_id}
+                                    </Typography>
+                                    <Chip
+                                        label={`Status: ${result.status}`}
+                                        color={result.status === "completed" ? "success" : "warning"}
+                                        sx={{ mb: 2 }}
+                                    />
+                                    <Divider sx={{ my: 1 }} />
+                                    <Typography variant="subtitle1" gutterBottom>
+                                        Summary:
+                                    </Typography>
+                                    {parsedSummary ? (
+                                        <pre style={{
+                                            background: "#f5f5f5", padding: "8px", borderRadius: "4px", whiteSpace: "pre-wrap",
+                                            wordWrap: "break-word", overflowX: "auto", maxWidth: "100%",
+                                        }}>
+                                            {JSON.stringify(parsedSummary, null, 2)}
+                                        </pre>
+                                    ) : (
+                                        <Typography>{result.summary || "N/A"}</Typography>
+                                    )}
+                                    <Divider sx={{ my: 2 }} />
+                                    <Typography variant="subtitle1">Investment Insights:</Typography>
+                                    {Array.isArray(result.investment_insights) &&
+                                        result.investment_insights.length > 0 ? (
+                                        <ul>
+                                            {result.investment_insights.map((ins, idx) => (
+                                                <li key={idx}>{ins}</li>
+                                            ))}
+                                        </ul>
+                                    ) : (
+                                        <Typography color="text.secondary">None</Typography>
+                                    )}
+                                    <Divider sx={{ my: 2 }} />
+                                    <Typography variant="subtitle1">Risk Assessment:</Typography>
+                                    {Array.isArray(result.risk_assessment) &&
+                                        result.risk_assessment.length > 0 ? (
+                                        <ul>
+                                            {result.risk_assessment.map((risk, idx) => (
+                                                <li key={idx}>{risk}</li>
+                                            ))}
+                                        </ul>
+                                    ) : (
+                                        <Typography color="text.secondary">None</Typography>
+                                    )}
+                                </CardContent>
+                            </Card>
+                        );
+                    })}
                 </Box>
             )}
+
+            {/* Analysis History */}
+            <Typography variant="h6" sx={{ mt: 4, mb: 1 }}>
+                Analysis History
+            </Typography>
+            <Paper>
+                <Table>
+                    <TableHead>
+                        <TableRow>
+                            <TableCell>Analysis ID</TableCell>
+                            <TableCell>Document</TableCell>
+                            <TableCell>Query</TableCell>
+                            <TableCell>Status</TableCell>
+                            <TableCell>Created</TableCell>
+                            <TableCell>Actions</TableCell>
+                        </TableRow>
+                    </TableHead>
+                    <TableBody>
+                        {analyses.map((a) => (
+                            <TableRow key={a.id}>
+                                <TableCell>{a.id}</TableCell>
+                                <TableCell>{a.document_id}</TableCell>
+                                <TableCell>{a.query}</TableCell>
+                                <TableCell>{a.status}</TableCell>
+                                <TableCell>{new Date(a.created_at).toLocaleString()}</TableCell>
+                                <TableCell>
+                                    {/* <Button variant="outlined" onClick={() => handleExport(result.id, `analysis_${result.id}.pdf`)}>
+                                        Export
+                                    </Button> */}
+                                    <Button variant="outlined" onClick={() => handleExport(a.id, `analysis_${a.id}.pdf`)}>
+                                        Export
+                                    </Button>
+                                </TableCell>
+                            </TableRow>
+                        ))}
+                    </TableBody>
+                </Table>
+            </Paper>
         </Box>
     );
 }
