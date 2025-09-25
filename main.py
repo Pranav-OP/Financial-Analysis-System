@@ -51,7 +51,7 @@ app = FastAPI(title="Financial Document Analyzer")
 # Allow CORS for local frontend during development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # adjust if you use other ports
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:5174"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -366,7 +366,7 @@ async def request_analysis(
 
     # Kick off CrewAI
     try:
-        print("PRINTING PATH & QUERY BEFORE CEW KICKOFF:", staged_path, req.query)
+        #print("PRINTING PATH & QUERY BEFORE CREW KICKOFF:", staged_path, req.query)
         result = crew.kickoff(
             inputs={"document_path": staged_path, "query": req.query}
         )

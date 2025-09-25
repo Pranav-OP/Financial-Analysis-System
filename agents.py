@@ -60,17 +60,17 @@ financial_analyst = Agent(
     role="Senior Financial Analyst",
     goal="Provide accurate, compliant, and data-driven analysis of financial documents and market trends.",
     backstory=(
-        "Input parameter for the document is {document_path}"
-        "You are an experienced financial analyst specializing in corporate earnings, "
-        "macroeconomic indicators, and investment trends. You carefully read reports, extract "
-        "key financial ratios, assess performance, and provide professional, compliant insights."
+        "The document is stored at path {document_path}"
+        "You are an experienced financial analyst specializing in corporate earnings, macroeconomic indicators,"
+        "and investment trends. You carefully read reports, extract key financial ratios, assess performance,"
+        "and provide professional, compliant insights based on relevant financial data found in document."
         "You ALWAYS format your final analysis as valid JSON with the following structure: "
         "{'analysis_type': 'financial_analysis', 'executive_summary': '...', 'key_metrics': {...}, "
         "'growth_trends': {...}, 'risks': [...], 'recommendations': [...]}"
     ),
     tools=[read_financial_document, analyze_investment_tool, create_risk_assessment_tool],
     llm=llm,
-    max_iter=3,
+    max_iter=1,
     max_rpm=10,
     verbose=True,
     allow_delegation=False
@@ -81,8 +81,10 @@ verifier = Agent(
     goal="Validate that uploaded files are genuine financial documents and suitable for analysis.",
     verbose=True,
     backstory=(
-        "You are responsible for verifying document integrity and type. "
+        "Input parameter for the document is {document_path}"
+        "You are responsible for verifying document integrity and its type. "
         "Your task is to ensure uploaded documents are relevant financial files "
+        "Categorize the given document as either financial or non-financial documents"
         "(e.g., 10-Q, annual reports, investor presentations) and reject irrelevant ones."
         "You ALWAYS return your verification result as valid JSON with this structure: "
         "{'verification_result': 'valid'|'invalid', 'document_type': '...', 'confidence': 0.0-1.0, "
@@ -90,7 +92,7 @@ verifier = Agent(
     ),
     tools=[read_financial_document],
     llm=llm,
-    max_iter=5,
+    max_iter=1,
     max_rpm=10,
     allow_delegation=True
 )
@@ -110,7 +112,7 @@ investment_advisor = Agent(
     ),
     tools=[analyze_investment_tool],
     llm=llm,
-    max_iter=3,
+    max_iter=1,
     max_rpm=10,
     allow_delegation=False
 )
@@ -129,7 +131,7 @@ risk_assessor = Agent(
     ),
     tools=[create_risk_assessment_tool],
     llm=llm,
-    max_iter=3,
+    max_iter=1,
     max_rpm=10,
     allow_delegation=False
 )
@@ -139,6 +141,7 @@ document_processor = Agent(
     goal="Handle file processing, path resolution, and ensure documents are accessible to other agents. Always return output in valid JSON format.",
     verbose=True,
     backstory=(
+        "Input parameter for the document is {document_path}"
         "You are responsible for processing uploaded documents and ensuring they are "
         "properly accessible to other agents. You handle file path resolution, "
         "document format validation, and initial content extraction. "
@@ -148,7 +151,7 @@ document_processor = Agent(
     ),
     tools=[read_financial_document],
     llm=llm,
-    max_iter=3,
+    max_iter=1,
     max_rpm=10,
     allow_delegation=False
 )

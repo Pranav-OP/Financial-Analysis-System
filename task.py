@@ -6,8 +6,10 @@ from tools import read_financial_document, analyze_investment_tool, create_risk_
 ## Creating a task to help solve user's query
 analyze_financial_document = Task(
     description=(
-        "Analyze the uploaded financial document. Extract key figures, ratios, and insights. "
-        "Summarize revenue, profit, expenses, and growth trends. Answer the user query: {query}"
+        "1. Read and extraxt the content of the document is stored at path {document_path}"
+        "2. Analyze the extracted financial data. Extract key figures, ratios, and insights. "
+        "3. Summarize revenue, profit, expenses, and growth trends."
+        "4. Answer the user query: {query}"
     ),
     expected_output=(
         "A structured report including:\n"
@@ -18,9 +20,10 @@ analyze_financial_document = Task(
         "- Clear and professional language"
     ),
     agent=financial_analyst,
-    tools=[read_financial_document,analyze_investment_tool],
+    tools=[read_financial_document, analyze_investment_tool],
     async_execution=False,
 )
+
 
 ## Creating an investment analysis task
 investment_analysis = Task(
@@ -40,9 +43,11 @@ investment_analysis = Task(
     async_execution=False,
 )
 
+
 ## Creating a risk assessment task
 risk_assessment = Task(
     description=(
+        
         "Identify financial and market risks mentioned in the document. "
         "Highlight vulnerabilities and propose mitigation strategies."
     ),
@@ -61,7 +66,10 @@ risk_assessment = Task(
     
 # Creating a file verification task
 verification_task = Task(
-    description="Verify whether the uploaded file is a valid financial document before analysis.",
+    description=(
+        
+        "Verify whether the uploaded file is a valid financial document before analysis."
+    ),
     expected_output="A validation result (valid/invalid) with reasoning.",
     agent=verifier,
     tools=[read_financial_document],
