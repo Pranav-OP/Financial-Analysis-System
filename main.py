@@ -366,6 +366,7 @@ async def request_analysis(
 
     # Kick off CrewAI
     try:
+        print("PRINTING PATH & QUERY BEFORE CEW KICKOFF:", staged_path, req.query)
         result = crew.kickoff(
             inputs={"document_path": staged_path, "query": req.query}
         )

@@ -16,7 +16,8 @@ def read_financial_document(path: str) -> str:
     3.Strip headers/footers like 'Page X'
     4.return the preprocessed text from document
     """
-
+    print(f"Printing Path in read_financial_document {path}")
+    
     # Normalize path to avoid path traversal issues
     path = os.path.normpath(path)
     if not os.path.exists(path):
