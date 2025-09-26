@@ -73,6 +73,6 @@ class AnalysisResult(BaseModel):
     completed_at: Optional[datetime] = None
     query: Optional[str] = None
     summary: Optional[str] = None
-    investment_insights: Optional[List[str]] = []
-    risk_assessment: Optional[List[str]] = []
+    investment_insights: Optional[str] = None
+    risk_assessment: Optional[str] = None
     raw_excerpt: Optional[str] = None   

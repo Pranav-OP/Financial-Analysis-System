@@ -174,6 +174,16 @@ function Dashboard() {
         }
     };
 
+    const parseJsonMaybe = (text) => {
+        if (!text) return null;
+        try {
+          const cleaned = typeof text === "string" ? text.replace(/```json|```/g, "").trim() : text;
+          return typeof cleaned === "string" ? JSON.parse(cleaned) : cleaned;
+        } catch {
+          return null;
+        }
+      };
+
     return (
         <Box>
             <Typography variant="h4" gutterBottom>
@@ -284,8 +294,8 @@ function Dashboard() {
                                     ) : (
                                         <Typography>{result.summary || "N/A"}</Typography>
                                     )}
-                                    <Divider sx={{ my: 2 }} />
-                                    <Typography variant="subtitle1">Investment Insights:</Typography>
+                                     <Divider sx={{ my: 2 }} />
+                                    {/*<Typography variant="subtitle1">Investment Insights:</Typography>
                                     {Array.isArray(result.investment_insights) &&
                                         result.investment_insights.length > 0 ? (
                                         <ul>
@@ -307,7 +317,53 @@ function Dashboard() {
                                         </ul>
                                     ) : (
                                         <Typography color="text.secondary">None</Typography>
-                                    )}
+                                    )} */}
+                                    <Typography variant="subtitle1">Investment Insights:</Typography>
+                                    {(() => {
+                                        const parsed = parseJsonMaybe(result.investment_insights);
+                                        if (parsed) {
+                                            return (
+                                                <pre style={{ background: "#f5f5f5", padding: "8px", borderRadius: "4px", whiteSpace: "pre-wrap", wordWrap: "break-word", overflowX: "auto" }}>
+                                                    {JSON.stringify(parsed, null, 2)}
+                                                </pre>
+                                            );
+                                        }
+                                        if (Array.isArray(result.investment_insights) && result.investment_insights.length > 0) {
+                                            return (
+                                                <ul>
+                                                    {result.investment_insights.map((ins, idx) => (<li key={idx}>{ins}</li>))}
+                                                </ul>
+                                            );
+                                        }
+                                        if (typeof result.investment_insights === "string" && result.investment_insights.trim()) {
+                                            return <pre style={{ background: "#f5f5f5", padding: "8px", borderRadius: "4px", whiteSpace: "pre-wrap" }}>{result.investment_insights}</pre>;
+                                        }
+                                        return <Typography color="text.secondary">None</Typography>;
+                                    })()}
+                                    <Divider sx={{ my: 2 }} />
+                                    <Typography variant="subtitle1">Risk Assessment:</Typography>
+                                    {(() => {
+                                        const parsed = parseJsonMaybe(result.risk_assessment);
+                                        if (parsed) {
+                                            return (
+                                                <pre style={{ background: "#f5f5f5", padding: "8px", borderRadius: "4px", whiteSpace: "pre-wrap", wordWrap: "break-word", overflowX: "auto" }}>
+                                                    {JSON.stringify(parsed, null, 2)}
+                                                </pre>
+                                            );
+                                        }
+                                        if (Array.isArray(result.risk_assessment) && result.risk_assessment.length > 0) {
+                                            return (
+                                                <ul>
+                                                    {result.risk_assessment.map((risk, idx) => (<li key={idx}>{risk}</li>))}
+                                                </ul>
+                                            );
+                                        }
+                                        if (typeof result.risk_assessment === "string" && result.risk_assessment.trim()) {
+                                            return <pre style={{ background: "#f5f5f5", padding: "8px", borderRadius: "4px", whiteSpace: "pre-wrap" }}>{result.risk_assessment}</pre>;
+                                        }
+                                        return <Typography color="text.secondary">None</Typography>;
+                                    })()}
+
                                 </CardContent>
                             </Card>
                         );

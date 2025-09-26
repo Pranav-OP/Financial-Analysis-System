@@ -1,7 +1,7 @@
 # -----------------------------------------------------------------------------
 # Imports
 # -----------------------------------------------------------------------------
-import os, io, csv, uuid, shutil
+import os, io, csv, uuid, shutil, json, re
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -31,16 +31,17 @@ from redis_utils import enqueue_analysis_job, get_cache, set_cache
 
 load_dotenv()
 
-from agents import financial_analyst, verifier, investment_advisor, risk_assessor
-from task import analyze_financial_document, investment_analysis, risk_assessment, verification_task
+from agents import financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler
+from task import analyze_financial_document, investment_analysis, risk_assessment, verification_task, final_report
+
 
 # -----------------------------------------------------------------------------
 # CrewAI SETUP
 # -----------------------------------------------------------------------------
 
 crew = Crew(
-    agents=[financial_analyst, verifier, investment_advisor, risk_assessor],
-    tasks=[analyze_financial_document, investment_analysis, risk_assessment, verification_task]
+    agents=[financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler],
+    tasks=[verification_task, analyze_financial_document, investment_analysis, risk_assessment, final_report]
 )
 
 # -----------------------------------------------------------------------------
@@ -364,35 +365,73 @@ async def request_analysis(
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
 
-    # Kick off CrewAI
     try:
-        #print("PRINTING PATH & QUERY BEFORE CREW KICKOFF:", staged_path, req.query)
-        result = crew.kickoff(
-            inputs={"document_path": staged_path, "query": req.query}
-        )
+        # Single Crew run with 4 tasks
+        result = crew.kickoff(inputs={"document_path": staged_path, "query": req.query})
+
+        print(f" ----- CREW FINAL RESULT ----- \n {result}")
+
+        out_text = getattr(result, "raw", None) or getattr(result, "output", None) or str(result)
+
+        def _first_json(text: str):
+            if not isinstance(text, str): return None
+            # fenced first
+            if "```" in text:
+                blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+                for b in blocks:
+                    try: return json.loads(b.strip())
+                    except: pass
+            m = re.search(r"\{[\s\S]*\}", text)
+            if m:
+                try: return json.loads(m.group(0))
+                except: return None
+            return None
+
+        combined = _first_json(out_text) or {}
+        summary_val = combined.get("summary")
+        investment_val = combined.get("investment_insights")
+        risk_val = combined.get("risk_assessment")
+
+        # summary pretty string
+        if isinstance(summary_val, (dict, list)):
+            summary = json.dumps(summary_val, ensure_ascii=False, indent=2)
+        else:
+            summary = str(summary_val) if summary_val is not None else "No summary produced."
+
+        # investment insights pretty string
+        if investment_val is not None:
+            investment_insights = json.dumps(investment_val, ensure_ascii=False, indent=2) \
+                if isinstance(investment_val, (dict, list)) else str(investment_val)
+        else:
+            investment_insights = None
+
+        # risk assessment pretty string
+        if risk_val is not None:
+            risk_assessment = json.dumps(risk_val, ensure_ascii=False, indent=2) \
+                if isinstance(risk_val, (dict, list)) else str(risk_val)
+        else:
+            risk_assessment = None
 
     except Exception as e:
         cleanup_staged_file(staged_path)
         raise HTTPException(500, f"Analysis failed: {str(e)}")
 
-    # Schedule cleanup (background task after response)
     if background_tasks:
         background_tasks.add_task(cleanup_staged_file, staged_path)
     else:
         cleanup_staged_file(staged_path)
 
-    # Save analysis result to DB
     analysis_id = str(uuid.uuid4())
+
     analysis_doc = {
         "_id": analysis_id,
         "document_id": doc_id,
         "status": "completed",
         "query": req.query,
-        "summary": result.output.get("summary") if hasattr(result, "output") else str(result),
-        "investment_insights": result.output.get("investment_insights", []) if hasattr(result, "output") else [],
-        "risk_assessment": result.output.get("risk_assessment", []) if hasattr(result, "output") else [],
-        "raw_excerpt": result.raw if hasattr(result, "raw") else None,
-        #"confidence": result.output.get("confidence", 0.0),
+        "summary": summary,
+        "investment_insights": investment_insights, 
+        "risk_assessment": risk_assessment,          
+        #"raw_excerpt": raw_text[:2000],
         "created_at": datetime.utcnow(),
         "completed_at": datetime.utcnow()
     }
@@ -408,9 +447,96 @@ async def request_analysis(
         summary=analysis_doc["summary"],
         investment_insights=analysis_doc["investment_insights"],
         risk_assessment=analysis_doc["risk_assessment"],
-        raw_excerpt=analysis_doc["raw_excerpt"]
+        #raw_excerpt=analysis_doc["raw_excerpt"]
     )
 
+    # try:
+    #     #print("PRINTING PATH & QUERY BEFORE CREW KICKOFF:", staged_path, req.query)
+    #     result = crew.kickoff(
+    #         inputs={"document_path": staged_path, "query": req.query}
+    #     )
+
+    # except Exception as e:
+    #     cleanup_staged_file(staged_path)
+    #     raise HTTPException(500, f"Analysis failed: {str(e)}")
+
+    # # Schedule cleanup (background task after response)
+    # if background_tasks:
+    #     background_tasks.add_task(cleanup_staged_file, staged_path)
+    # else:
+    #     cleanup_staged_file(staged_path)
+
+    # # Save analysis result to DB
+    # analysis_id = str(uuid.uuid4())
+
+    # # ---------- Extract results from tasks by index ----------
+    # print(f"------- PRINTING RAW CREW RESULT ------- \n{result}")
+
+    # summary = ""
+    # investment_insights = []
+    # risk_assessment = []
+
+    # # Task indices with current order:
+    # # 0: verification_task
+    # # 1: analyze_financial_document (Financial Analyst) -> summary
+    # # 2: investment_analysis (Investment Advisor) -> investment_insights
+    # # 3: risk_assessment (Risk Specialist) -> risk_assessment
+    # if hasattr(result, "tasks_output") and result.tasks_output:
+    #     for idx, task_output in enumerate(result.tasks_output):
+    #         out_text = getattr(task_output, "output", "") or ""
+    #         if idx == 1:
+    #             parsed = _extract_first_json_block(out_text)
+    #             if parsed:
+    #                 summary = _pretty_json(parsed)
+    #             else:
+    #                 summary = out_text
+    #         # inside the loop over tasks_output
+    #         elif idx == 2:
+    #             parsed = _extract_first_json_block(out_text)
+    #             if parsed:
+    #                 investment_insights.append(json.dumps(parsed, ensure_ascii=False))
+    #             elif out_text and out_text.strip():
+    #                 investment_insights.append(out_text.strip())
+
+    #         elif idx == 3:
+    #             parsed = _extract_first_json_block(out_text)
+    #             simplified = _simplify_risk_json(parsed) if parsed else None
+    #             if simplified:
+    #                 risk_assessment.append(json.dumps(simplified, ensure_ascii=False))
+    #             elif out_text and out_text.strip():
+    #                 risk_assessment.append(out_text.strip())
+
+    # if not summary:
+    #     summary = "Analysis completed, but no structured summary was produced."
+
+    # analysis_doc = {
+    #     "_id": analysis_id,
+    #     "document_id": doc_id,
+    #     "status": "completed",
+    #     "query": req.query,
+    #     "summary": summary,
+    #     "investment_insights": investment_insights,
+    #     "risk_assessment": risk_assessment,
+    #     "raw_excerpt": result.raw if hasattr(result, "raw") else None,
+    #     "created_at": datetime.utcnow(),
+    #     "completed_at": datetime.utcnow()
+    # }
+    # await db.analyses.insert_one(analysis_doc)
+
+    # return AnalysisResult(
+    #     id=analysis_id,
+    #     document_id=doc_id,
+    #     status="completed",
+    #     created_at=analysis_doc["created_at"],
+    #     completed_at=analysis_doc["completed_at"],
+    #     query=analysis_doc["query"],
+    #     summary=analysis_doc["summary"],
+    #     investment_insights=analysis_doc["investment_insights"],
+    #     risk_assessment=analysis_doc["risk_assessment"],
+    #     raw_excerpt=analysis_doc["raw_excerpt"]
+    # )
+
+    
 
 @app.get("/analyses/{analysis_id}", response_model=AnalysisResult)
 async def get_analysis(analysis_id: str):
@@ -491,6 +617,86 @@ async def export_analysis(analysis_id: str, format: str = "pdf", current_user=De
     
     else:
         raise HTTPException(400, "Unsupported format")
+
+# -----------------------------------------------------------------------------
+# CREW OUTPUT HELPERS
+# -----------------------------------------------------------------------------
+
+# def _extract_first_json_block(text: str):
+#     """Return first JSON object/dict parsed from a string; supports ```json blocks and bare braces."""
+#     try:
+#         if not isinstance(text, str):
+#             return None
+#         # Prefer fenced json
+#         if "```" in text:
+#             import re, json
+
+#             fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+#             for block in fenced:
+#                 block = block.strip()
+#                 if not block:
+#                     continue
+#                 try:
+#                     return json.loads(block)
+#                 except Exception:
+#                     continue
+#         # Fallback: first outermost brace span
+#         import re, json
+
+#         m = re.search(r"\{[\s\S]*\}", text)
+#         if m:
+#             return json.loads(m.group(0))
+#     except Exception:
+#         return None
+#     return None
+
+
+# def _pretty_json(obj):
+#     import json
+
+#     try:
+#         return json.dumps(obj, ensure_ascii=False, indent=2)
+#     except Exception:
+#         return str(obj)
+
+
+# def _simplify_risk_json(data):
+#     """Normalize to:
+#     {
+#       "assessment_type": "risk_analysis",
+#       "identified_risks": [{ "risk","description","severity","likelihood","strategy" }]
+#     }
+#     """
+#     if not isinstance(data, dict):
+#         return None
+#     out = {"assessment_type": "risk_analysis", "identified_risks": []}
+#     risks = []
+
+#     # Accept common shapes
+#     if isinstance(data.get("identified_risks"), list):
+#         risks = data["identified_risks"]
+#     elif "risks" in data and isinstance(data["risks"], list):
+#         risks = data["risks"]
+
+#     simplified = []
+#     for r in risks:
+#         if not isinstance(r, dict):
+#             continue
+#         simplified.append(
+#             {
+#                 "risk": r.get("risk") or r.get("risk_name") or r.get("name") or "",
+#                 "description": r.get("description") or "",
+#                 "severity": r.get("severity") or "",
+#                 "likelihood": r.get("likelihood") or "",
+#                 "strategy": r.get("strategy")
+#                 or r.get("mitigation")
+#                 or r.get("mitigation_strategy")
+#                 or "",
+#             }
+#         )
+#     out["identified_risks"] = [x for x in simplified if any(v for v in x.values())]
+#     return out
+
 
 # -----------------------------------------------------------------------------
 # ENTRYPOINT

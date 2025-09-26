@@ -1,6 +1,8 @@
 import os
 import re
 import unicodedata
+import warnings
+import logging
 from collections import OrderedDict
 from dotenv import load_dotenv
 from crewai.tools import tool
@@ -9,6 +11,11 @@ import pdfplumber
 
 load_dotenv()
 
+# Suppress PDF parsing warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pdfplumber")
+logging.getLogger("pdfplumber").setLevel(logging.ERROR)
+
+# preprocess the financial text
 def preprocess_financial_text(raw: str) -> str:
     # 1) Unicode normalize
     txt = unicodedata.normalize("NFKC", raw)
@@ -61,46 +68,7 @@ def preprocess_financial_text(raw: str) -> str:
     return cleaned
 
 
-# def read_financial_document(path: str) -> str:
-#     """
-#     Reads and preprocesses text from a financial PDF document.
-#     Uses PDFSearchTool internally, then applies basic cleaning:
-#     1.Normalize whitespace
-#     2.Remove duplicate newlines/spaces
-#     3.Strip headers/footers like 'Page X'
-#     4.return the preprocessed text from document
-#     """
-#     print(f"Printing Path in read_financial_document {path}")
-    
-#     # Normalize path to avoid path traversal issues
-#     path = os.path.normpath(path)
-#     if not os.path.exists(path):
-#         raise FileNotFoundError(f"File not found: {path}")
-
-#     print(f"Printing Path in read_financial_document {path}")
-#     # Extract raw text
-#     import PyPDF2
-
-#     with open(path, "rb") as f:
-#         reader = PyPDF2.PdfReader(f)
-#         pdf_content = ""
-#         for page in reader.pages:
-#             pdf_content += page.extract_text() or ""
-
-#     print("Extracted PDF content before passing to PDFSearchTool:\n", pdf_content)
-
-#     # Now pass the content to PDFSearchTool
-#     pdf_tool = pdf_search_tool.PDFSearchTool(pdf=path, content=pdf_content)
-#     raw_text = pdf_tool.run("Extract full text") or ""
-
-#     # Preprocessing
-#     text = raw_text.encode("utf-8", errors="ignore").decode("utf-8")
-#     text = re.sub(r"\n{2,}", "\n", text)         # collapse multiple newlines
-#     text = re.sub(r"[ \t]{2,}", " ", text)       # collapse multiple spaces/tabs
-#     text = re.sub(r"Page \d+\s*", "", text)      # strip page markers
-#     text = text.strip()
-
-#     return text
+# -------- Tools --------
 
 @tool("read_financial_document")
 def read_financial_document(path: str) -> str:
@@ -115,18 +83,33 @@ def read_financial_document(path: str) -> str:
     # Extract text locally (no external API/tool)
     text_chunks = []
     if path.lower().endswith(".pdf"):
-        with pdfplumber.open(path) as pdf:
-            for page in pdf.pages:
-                text_chunks.append(page.extract_text() or "")
+        try:
+            with pdfplumber.open(path) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    try:
+                        text = page.extract_text()
+                        if text:
+                            text_chunks.append(text)
+                    except Exception as e:
+                        print(f"Warning: Could not extract text from page {page_num}: {e}")
+                        continue
+        except Exception as e:
+            raise Exception(f"Failed to open PDF file: {e}")
     else:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             text_chunks.append(f.read())
 
     raw_text = "\n".join(text_chunks)
+    
+    if not raw_text.strip():
+        raise Exception("No text could be extracted from the document")
 
-    print(f"Printing Raw Text in read_financial_document \n {raw_text}")
+    print(f"Successfully extracted {len(raw_text)} characters from document")
+    
     # Preprocess
     cleaned = preprocess_financial_text(raw_text)
+
+    print(f"Preprocessed extracted text has {len(raw_text)} characters before returning")
 
     return cleaned
 

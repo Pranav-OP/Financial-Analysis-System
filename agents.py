@@ -47,6 +47,7 @@ class LiteLLMWrapper:
 # Create the LLM instance with correct model format
 llm = LiteLLMWrapper(
     model_name="gemini/gemini-2.0-flash", 
+    #model_name="gemini/gemini-2.5-flash-lite", 
     temperature=0.3
 )
 
@@ -150,6 +151,23 @@ document_processor = Agent(
         "'file_size': 0, 'pages': 0, 'error_message': null}"
     ),
     tools=[read_financial_document],
+    llm=llm,
+    max_iter=1,
+    max_rpm=10,
+    allow_delegation=False
+)
+
+
+# Report compiler agent
+report_compiler = Agent(
+    role="Report Compiler",
+    goal="Combine prior agents' outputs into one final JSON object with summary, investment insights, and risk assessment.",
+    backstory=(
+        "You consolidate the outputs from Financial Analyst, Investment Advisor, and Risk Specialist. "
+        "You must output a single valid JSON with exactly these keys: "
+        '{"summary": {... or string}, "investment_insights": {...}, "risk_assessment": {"assessment_type":"risk_analysis","identified_risks":[...]}} '
+        "No markdown fences, no extra text."
+    ),
     llm=llm,
     max_iter=1,
     max_rpm=10,
