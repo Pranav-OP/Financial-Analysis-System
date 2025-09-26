@@ -594,11 +594,12 @@ async def export_analysis(analysis_id: str, format: str = "pdf", current_user=De
     if format == "pdf":
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer)
-        styles = getSampleStyleSheet()
-        story = [
-            Paragraph(f"Query: {analysis['query']}", styles["Normal"]),
-            Paragraph(f"Summary: {analysis['summary']}", styles["BodyText"]),
-        ]
+        story = build_analysis_pdf_story({
+            "query": analysis["query"],
+            "summary": analysis["summary"],
+            "investment_insights": analysis.get("investment_insights"),
+            "risk_assessment": analysis.get("risk_assessment"),
+        })
         doc.build(story)
         buffer.seek(0)
         return StreamingResponse(buffer, media_type="application/pdf", headers={
@@ -617,6 +618,243 @@ async def export_analysis(analysis_id: str, format: str = "pdf", current_user=De
     
     else:
         raise HTTPException(400, "Unsupported format")
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+
+def _fmt_alloc_value(v):
+    # Normalize cell values for the "Allocation" column
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)):
+        return f"{v:g}%"
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        # Prefer the descriptive text if present
+        for key in ("description", "desc", "text", "allocation"):
+            if key in v and isinstance(v[key], (str, int, float)):
+                return _fmt_alloc_value(v[key])
+        # Fallback: key: value pairs
+        parts = []
+        for k, vv in v.items():
+            vv_str = _fmt_alloc_value(vv)
+            if vv_str:
+                parts.append(f"{k.replace('_',' ').title()}: {vv_str}")
+        return "; ".join(parts)
+    if isinstance(v, list):
+        return "; ".join(_fmt_alloc_value(x) for x in v if x is not None)
+    return str(v)
+
+def _alloc_table_from_mapping(mapping: dict):
+    # Wrapping style for table cells
+    wrap = ParagraphStyle(
+        name="Wrap9", parent=getSampleStyleSheet()["BodyText"],
+        fontSize=9, leading=12, wordWrap="CJK"
+    )
+    data = [
+        [Paragraph("Asset Class", wrap), Paragraph("Allocation", wrap)]
+    ]
+    for k, v in mapping.items():
+        left = Paragraph(k.replace("_", " ").title(), wrap)
+        right = Paragraph(_fmt_alloc_value(v), wrap)
+        data.append([left, right])
+    tbl = Table(
+        data, hAlign="LEFT", colWidths=[1.6*inch, 4.8*inch], repeatRows=1
+    )
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return tbl
+
+def _parse_json_maybe(text):
+    if not text:
+        return None
+    try:
+        cleaned = text.replace("```json", "").replace("```", "").strip()
+        import json
+        return json.loads(cleaned)
+    except Exception:
+        return None
+
+def _kv_table_from_dict(d: dict, col1="Metric", col2="Value"):
+    data = [[col1, col2]]
+    for k, v in d.items():
+        data.append([str(k).replace("_", " ").title(), str(v)])
+    tbl = Table(data, hAlign="LEFT")
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+    ]))
+    return tbl
+
+def _bullet_list(items, styles):
+    story = []
+    if not items:
+        return story
+    for it in items:
+        story.append(Paragraph(f"• {it}", styles["BodyText"]))
+        story.append(Spacer(1, 4))
+    return story
+
+def build_analysis_pdf_story(analysis: dict):
+    """
+    Returns a list of Flowables for ReportLab PDF with all three sections.
+    analysis expects keys: query, summary(str JSON), investment_insights(str JSON), risk_assessment(str JSON)
+    """
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="H1", parent=styles["Heading1"], alignment=TA_LEFT, spaceAfter=10))
+    styles.add(ParagraphStyle(name="H2", parent=styles["Heading2"], alignment=TA_LEFT, spaceAfter=8))
+    styles.add(ParagraphStyle(name="Mono", parent=styles["BodyText"], fontName="Courier", fontSize=9, leading=12))
+
+    story = []
+    # Title and meta
+    story.append(Paragraph("Financial Document Analysis", styles["H1"]))
+    story.append(Paragraph(f"Query: {analysis.get('query') or '-'}", styles["BodyText"]))
+    story.append(Spacer(1, 10))
+
+    # ---------- Summary ----------
+    story.append(Paragraph("Summary", styles["H2"]))
+    parsed_summary = _parse_json_maybe(analysis.get("summary"))
+    if isinstance(parsed_summary, dict):
+        # Executive summary
+        exec_sum = parsed_summary.get("executive_summary")
+        if exec_sum:
+            story.append(Paragraph(exec_sum, styles["BodyText"]))
+            story.append(Spacer(1, 8))
+        # Key metrics table
+        metrics = parsed_summary.get("key_metrics")
+        if isinstance(metrics, dict) and metrics:
+            story.append(Paragraph("Key Metrics", styles["H2"]))
+            story.append(_kv_table_from_dict(metrics))
+            story.append(Spacer(1, 8))
+        # Growth trends bullets
+        growth = parsed_summary.get("growth_trends")
+        if isinstance(growth, dict) and growth:
+            story.append(Paragraph("Growth Trends", styles["H2"]))
+            story.extend(_bullet_list([f"{k.replace('_',' ').title()}: {v}" for k, v in growth.items()], styles))
+            story.append(Spacer(1, 8))
+        # Risks bullets (from summary block)
+        risks = parsed_summary.get("risks")
+        if isinstance(risks, list) and risks:
+            story.append(Paragraph("Summary Risks", styles["H2"]))
+            story.extend(_bullet_list(risks, styles))
+            story.append(Spacer(1, 8))
+        # Recommendations bullets
+        recs = parsed_summary.get("recommendations")
+        if isinstance(recs, list) and recs:
+            story.append(Paragraph("Recommendations", styles["H2"]))
+            story.extend(_bullet_list(recs, styles))
+            story.append(Spacer(1, 12))
+    else:
+        # Fallback to raw text
+        raw = analysis.get("summary") or "No summary available."
+        story.append(Paragraph(raw, styles["BodyText"]))
+        story.append(Spacer(1, 12))
+
+    # ---------- Investment Insights ----------
+    story.append(Paragraph("Investment Insights", styles["H2"]))
+    parsed_inv = _parse_json_maybe(analysis.get("investment_insights"))
+    if isinstance(parsed_inv, dict):
+        # Themes
+        themes = parsed_inv.get("investment_themes")
+        if isinstance(themes, list) and themes:
+            story.append(Paragraph("Themes", styles["H2"]))
+            story.extend(_bullet_list(themes, styles))
+        # Asset allocation table
+        alloc = parsed_inv.get("asset_allocation")
+        if isinstance(alloc, dict) and alloc:
+            story.append(Spacer(1, 6))
+            story.append(_alloc_table_from_mapping(alloc))
+        # Risk assessment text
+        inv_risk = parsed_inv.get("risk_assessment")
+        if inv_risk:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph(f"Risk Assessment: {inv_risk}", styles["BodyText"]))
+        # Time horizon and disclaimer
+        th = parsed_inv.get("time_horizon")
+        if th:
+            story.append(Spacer(1, 4))
+            story.append(Paragraph(f"Time Horizon: {th}", styles["BodyText"]))
+        disc = parsed_inv.get("disclaimer")
+        if disc:
+            story.append(Spacer(1, 6))
+            story.append(Paragraph(f"Disclaimer: {disc}", styles["BodyText"]))
+        story.append(Spacer(1, 12))
+    else:
+        raw = analysis.get("investment_insights")
+        story.append(Paragraph(raw or "No investment insights.", styles["BodyText"]))
+        story.append(Spacer(1, 12))
+
+    # ---------- Risk Assessment ----------
+    story.append(Paragraph("Risk Assessment", styles["H2"]))
+    parsed_risk = _parse_json_maybe(analysis.get("risk_assessment"))
+    if isinstance(parsed_risk, dict):
+        risks = parsed_risk.get("identified_risks") or []
+        if risks:
+            # wrapping style for table cells
+            wrap = ParagraphStyle(
+                name="Wrap9",
+                parent=styles["BodyText"],
+                fontSize=9,
+                leading=12,
+                wordWrap="CJK"  # forces wrapping even for long words/URLs
+            )
+
+            # header
+            risk_rows = [
+                [
+                    Paragraph("Risk", wrap),
+                    Paragraph("Severity", wrap),
+                    Paragraph("Likelihood", wrap),
+                    Paragraph("Strategy", wrap),
+                ]
+            ]
+
+            # rows
+            for r in risks:
+                risk_rows.append([
+                    Paragraph((r.get("risk") or r.get("risk_name") or ""), wrap),
+                    Paragraph(r.get("severity") or "", wrap),
+                    Paragraph(r.get("likelihood") or "", wrap),
+                    Paragraph(r.get("strategy") or "", wrap),
+                ])
+
+            # set reasonable column widths and enable top-alignment + grid
+            tbl = Table(
+                risk_rows,
+                hAlign="LEFT",
+                colWidths=[2.2*inch, 0.9*inch, 0.9*inch, 3.0*inch],  # adjust if needed
+                repeatRows=1  # repeat header on page breaks
+            )
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (1, 1), (2, -1), "CENTER"),  # center severity/likelihood
+            ]))
+            story.append(tbl)
+        else:
+            story.append(Paragraph("No risks identified.", styles["BodyText"]))
+    else:
+        raw = analysis.get("risk_assessment")
+        story.append(Paragraph(raw or "No risk assessment.", styles["BodyText"]))
+
+    return story
 
 # -----------------------------------------------------------------------------
 # CREW OUTPUT HELPERS
