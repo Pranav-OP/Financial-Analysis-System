@@ -31,13 +31,12 @@ from redis_utils import enqueue_analysis_job, get_cache, set_cache
 
 load_dotenv()
 
-from agents import financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler
-from task import analyze_financial_document, investment_analysis, risk_assessment, verification_task, final_report
-
-
 # -----------------------------------------------------------------------------
 # CrewAI SETUP
 # -----------------------------------------------------------------------------
+
+from agents import financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler
+from task import analyze_financial_document, investment_analysis, risk_assessment, verification_task, final_report
 
 crew = Crew(
     agents=[financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler],
@@ -244,11 +243,6 @@ async def upload_document(
     file_id = str(uuid.uuid4())
     content = await file.read()
 
-    # file_path = f"data/{file_id}_{file.filename}"
-    # os.makedirs("data", exist_ok=True)
-    # with open(file_path, "wb") as f:
-    #     f.write(content)
-
     # Save file into GridFS
     gridfs_file_id = await gridfs_bucket.upload_from_stream(file.filename, content)
 
@@ -430,8 +424,7 @@ async def request_analysis(
         "query": req.query,
         "summary": summary,
         "investment_insights": investment_insights, 
-        "risk_assessment": risk_assessment,          
-        #"raw_excerpt": raw_text[:2000],
+        "risk_assessment": risk_assessment,
         "created_at": datetime.utcnow(),
         "completed_at": datetime.utcnow()
     }
@@ -449,94 +442,7 @@ async def request_analysis(
         risk_assessment=analysis_doc["risk_assessment"],
         #raw_excerpt=analysis_doc["raw_excerpt"]
     )
-
-    # try:
-    #     #print("PRINTING PATH & QUERY BEFORE CREW KICKOFF:", staged_path, req.query)
-    #     result = crew.kickoff(
-    #         inputs={"document_path": staged_path, "query": req.query}
-    #     )
-
-    # except Exception as e:
-    #     cleanup_staged_file(staged_path)
-    #     raise HTTPException(500, f"Analysis failed: {str(e)}")
-
-    # # Schedule cleanup (background task after response)
-    # if background_tasks:
-    #     background_tasks.add_task(cleanup_staged_file, staged_path)
-    # else:
-    #     cleanup_staged_file(staged_path)
-
-    # # Save analysis result to DB
-    # analysis_id = str(uuid.uuid4())
-
-    # # ---------- Extract results from tasks by index ----------
-    # print(f"------- PRINTING RAW CREW RESULT ------- \n{result}")
-
-    # summary = ""
-    # investment_insights = []
-    # risk_assessment = []
-
-    # # Task indices with current order:
-    # # 0: verification_task
-    # # 1: analyze_financial_document (Financial Analyst) -> summary
-    # # 2: investment_analysis (Investment Advisor) -> investment_insights
-    # # 3: risk_assessment (Risk Specialist) -> risk_assessment
-    # if hasattr(result, "tasks_output") and result.tasks_output:
-    #     for idx, task_output in enumerate(result.tasks_output):
-    #         out_text = getattr(task_output, "output", "") or ""
-    #         if idx == 1:
-    #             parsed = _extract_first_json_block(out_text)
-    #             if parsed:
-    #                 summary = _pretty_json(parsed)
-    #             else:
-    #                 summary = out_text
-    #         # inside the loop over tasks_output
-    #         elif idx == 2:
-    #             parsed = _extract_first_json_block(out_text)
-    #             if parsed:
-    #                 investment_insights.append(json.dumps(parsed, ensure_ascii=False))
-    #             elif out_text and out_text.strip():
-    #                 investment_insights.append(out_text.strip())
-
-    #         elif idx == 3:
-    #             parsed = _extract_first_json_block(out_text)
-    #             simplified = _simplify_risk_json(parsed) if parsed else None
-    #             if simplified:
-    #                 risk_assessment.append(json.dumps(simplified, ensure_ascii=False))
-    #             elif out_text and out_text.strip():
-    #                 risk_assessment.append(out_text.strip())
-
-    # if not summary:
-    #     summary = "Analysis completed, but no structured summary was produced."
-
-    # analysis_doc = {
-    #     "_id": analysis_id,
-    #     "document_id": doc_id,
-    #     "status": "completed",
-    #     "query": req.query,
-    #     "summary": summary,
-    #     "investment_insights": investment_insights,
-    #     "risk_assessment": risk_assessment,
-    #     "raw_excerpt": result.raw if hasattr(result, "raw") else None,
-    #     "created_at": datetime.utcnow(),
-    #     "completed_at": datetime.utcnow()
-    # }
-    # await db.analyses.insert_one(analysis_doc)
-
-    # return AnalysisResult(
-    #     id=analysis_id,
-    #     document_id=doc_id,
-    #     status="completed",
-    #     created_at=analysis_doc["created_at"],
-    #     completed_at=analysis_doc["completed_at"],
-    #     query=analysis_doc["query"],
-    #     summary=analysis_doc["summary"],
-    #     investment_insights=analysis_doc["investment_insights"],
-    #     risk_assessment=analysis_doc["risk_assessment"],
-    #     raw_excerpt=analysis_doc["raw_excerpt"]
-    # )
-
-    
+   
 
 @app.get("/analyses/{analysis_id}", response_model=AnalysisResult)
 async def get_analysis(analysis_id: str):
@@ -618,6 +524,90 @@ async def export_analysis(analysis_id: str, format: str = "pdf", current_user=De
     
     else:
         raise HTTPException(400, "Unsupported format")
+
+
+# -----------------------------------------------------------------------------
+# CREW OUTPUT HELPERS
+# -----------------------------------------------------------------------------
+
+# def _extract_first_json_block(text: str):
+#     """Return first JSON object/dict parsed from a string; supports ```json blocks and bare braces."""
+#     try:
+#         if not isinstance(text, str):
+#             return None
+#         # Prefer fenced json
+#         if "```" in text:
+#             import re, json
+
+#             fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+#             for block in fenced:
+#                 block = block.strip()
+#                 if not block:
+#                     continue
+#                 try:
+#                     return json.loads(block)
+#                 except Exception:
+#                     continue
+#         # Fallback: first outermost brace span
+#         import re, json
+
+#         m = re.search(r"\{[\s\S]*\}", text)
+#         if m:
+#             return json.loads(m.group(0))
+#     except Exception:
+#         return None
+#     return None
+
+
+# def _pretty_json(obj):
+#     import json
+
+#     try:
+#         return json.dumps(obj, ensure_ascii=False, indent=2)
+#     except Exception:
+#         return str(obj)
+
+
+# def _simplify_risk_json(data):
+#     """Normalize to:
+#     {
+#       "assessment_type": "risk_analysis",
+#       "identified_risks": [{ "risk","description","severity","likelihood","strategy" }]
+#     }
+#     """
+#     if not isinstance(data, dict):
+#         return None
+#     out = {"assessment_type": "risk_analysis", "identified_risks": []}
+#     risks = []
+
+#     # Accept common shapes
+#     if isinstance(data.get("identified_risks"), list):
+#         risks = data["identified_risks"]
+#     elif "risks" in data and isinstance(data["risks"], list):
+#         risks = data["risks"]
+
+#     simplified = []
+#     for r in risks:
+#         if not isinstance(r, dict):
+#             continue
+#         simplified.append(
+#             {
+#                 "risk": r.get("risk") or r.get("risk_name") or r.get("name") or "",
+#                 "description": r.get("description") or "",
+#                 "severity": r.get("severity") or "",
+#                 "likelihood": r.get("likelihood") or "",
+#                 "strategy": r.get("strategy")
+#                 or r.get("mitigation")
+#                 or r.get("mitigation_strategy")
+#                 or "",
+#             }
+#         )
+#     out["identified_risks"] = [x for x in simplified if any(v for v in x.values())]
+#     return out
+
+# -----------------------------------------------------------------------------
+# EXPORT ANALYSES HELPERS
+# -----------------------------------------------------------------------------
 
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -855,85 +845,6 @@ def build_analysis_pdf_story(analysis: dict):
         story.append(Paragraph(raw or "No risk assessment.", styles["BodyText"]))
 
     return story
-
-# -----------------------------------------------------------------------------
-# CREW OUTPUT HELPERS
-# -----------------------------------------------------------------------------
-
-# def _extract_first_json_block(text: str):
-#     """Return first JSON object/dict parsed from a string; supports ```json blocks and bare braces."""
-#     try:
-#         if not isinstance(text, str):
-#             return None
-#         # Prefer fenced json
-#         if "```" in text:
-#             import re, json
-
-#             fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-#             for block in fenced:
-#                 block = block.strip()
-#                 if not block:
-#                     continue
-#                 try:
-#                     return json.loads(block)
-#                 except Exception:
-#                     continue
-#         # Fallback: first outermost brace span
-#         import re, json
-
-#         m = re.search(r"\{[\s\S]*\}", text)
-#         if m:
-#             return json.loads(m.group(0))
-#     except Exception:
-#         return None
-#     return None
-
-
-# def _pretty_json(obj):
-#     import json
-
-#     try:
-#         return json.dumps(obj, ensure_ascii=False, indent=2)
-#     except Exception:
-#         return str(obj)
-
-
-# def _simplify_risk_json(data):
-#     """Normalize to:
-#     {
-#       "assessment_type": "risk_analysis",
-#       "identified_risks": [{ "risk","description","severity","likelihood","strategy" }]
-#     }
-#     """
-#     if not isinstance(data, dict):
-#         return None
-#     out = {"assessment_type": "risk_analysis", "identified_risks": []}
-#     risks = []
-
-#     # Accept common shapes
-#     if isinstance(data.get("identified_risks"), list):
-#         risks = data["identified_risks"]
-#     elif "risks" in data and isinstance(data["risks"], list):
-#         risks = data["risks"]
-
-#     simplified = []
-#     for r in risks:
-#         if not isinstance(r, dict):
-#             continue
-#         simplified.append(
-#             {
-#                 "risk": r.get("risk") or r.get("risk_name") or r.get("name") or "",
-#                 "description": r.get("description") or "",
-#                 "severity": r.get("severity") or "",
-#                 "likelihood": r.get("likelihood") or "",
-#                 "strategy": r.get("strategy")
-#                 or r.get("mitigation")
-#                 or r.get("mitigation_strategy")
-#                 or "",
-#             }
-#         )
-#     out["identified_risks"] = [x for x in simplified if any(v for v in x.values())]
-#     return out
 
 
 # -----------------------------------------------------------------------------
