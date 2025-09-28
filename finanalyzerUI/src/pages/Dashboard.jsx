@@ -29,6 +29,7 @@ function Dashboard() {
     const [analysisResults, setAnalysisResults] = useState({});
     const [error, setError] = useState("");
     const [user, setUser] = useState(null);
+    const [runningJobs, setRunningJobs] = useState({});
 
     useEffect(() => {
         if (localStorage.getItem("access_token")) {
@@ -37,6 +38,7 @@ function Dashboard() {
         fetchDocuments();
         fetchAnalyses();
     }, []);
+
 
     const fetchUser = async () => {
         try {
@@ -98,14 +100,56 @@ function Dashboard() {
         setError("");
         try {
             const res = await api.post(`/analyses/${docId}`, { query });
-            setAnalysisResults((prev) => ({ ...prev, [docId]: res.data }));
-            fetchAnalyses();
+            const { job_id } = res.data;
+
+            // Track the job
+            setRunningJobs(prev => ({ ...prev, [docId]: job_id }));
+
+            // Start polling for status
+            pollJobStatus(docId, job_id);
+
         } catch (err) {
             console.error(err);
-            setError("Analysis failed.");
+            setError("Analysis failed to start.");
         } finally {
             setLoading(false);
         }
+    };
+
+    const pollJobStatus = async (docId, jobId) => {
+        const poll = async () => {
+            try {
+                const res = await api.get(`/analyses/job/${jobId}`);
+                const { status } = res.data;
+
+                if (status === "completed") {
+                    // Job completed, fetch the analysis result
+                    const analysisRes = await api.get(`/analyses/${jobId}`);
+                    setAnalysisResults(prev => ({ ...prev, [docId]: analysisRes.data }));
+                    setRunningJobs(prev => {
+                        const newJobs = { ...prev };
+                        delete newJobs[docId];
+                        return newJobs;
+                    });
+                    fetchAnalyses();
+                } else if (status === "failed") {
+                    setError("Analysis failed.");
+                    setRunningJobs(prev => {
+                        const newJobs = { ...prev };
+                        delete newJobs[docId];
+                        return newJobs;
+                    });
+                } else {
+                    // Still running, poll again in 2 seconds
+                    setTimeout(poll, 2000);
+                }
+            } catch (err) {
+                console.error("Polling error:", err);
+                setError("Failed to check analysis status.");
+            }
+        };
+
+        poll();
     };
 
     const handleDelete = async (docId) => {
@@ -139,7 +183,6 @@ function Dashboard() {
         }
     };
 
-
     const handleExport = async (analysisId, filename = "analysis_export.pdf") => {
         try {
             const res = await api.get(`/analyses/${analysisId}/export`, {
@@ -159,7 +202,6 @@ function Dashboard() {
         }
     };
 
-
     const canUpload = user?.roles.includes("analyst") || user?.roles.includes("admin");
     const canAnalyze = canUpload;
 
@@ -177,12 +219,27 @@ function Dashboard() {
     const parseJsonMaybe = (text) => {
         if (!text) return null;
         try {
-          const cleaned = typeof text === "string" ? text.replace(/```json|```/g, "").trim() : text;
-          return typeof cleaned === "string" ? JSON.parse(cleaned) : cleaned;
+            const cleaned = typeof text === "string" ? text.replace(/```json|```/g, "").trim() : text;
+            return typeof cleaned === "string" ? JSON.parse(cleaned) : cleaned;
         } catch {
-          return null;
+            return null;
         }
-      };
+    };
+
+    const handleRetryAnalysis = async (docId) => {
+        try {
+            setAnalyzing(true);
+            const response = await api.post(`/analyses/${docId}`);
+            if (response.data.job_id) {
+                setCurrentJobId(response.data.job_id);
+                // Start polling again
+                pollAnalysisStatus(response.data.job_id);
+            }
+        } catch (error) {
+            console.error('Retry failed:', error);
+            setAnalyzing(false);
+        }
+    };
 
     return (
         <Box>
@@ -246,8 +303,12 @@ function Dashboard() {
                                             Download
                                         </Button>
                                         {canAnalyze && (
-                                            <Button variant="outlined" onClick={() => runAnalysis(doc.id)}>
-                                                Analyze
+                                            <Button
+                                                variant="outlined"
+                                                onClick={() => runAnalysis(doc.id)}
+                                                disabled={runningJobs[doc.id]}
+                                            >
+                                                {runningJobs[doc.id] ? "Analyzing..." : "Analyze"}
                                             </Button>
                                         )}
                                         <Button variant="outlined" color="error" onClick={() => handleDelete(doc.id)}>
@@ -277,9 +338,20 @@ function Dashboard() {
                                     </Typography>
                                     <Chip
                                         label={`Status: ${result.status}`}
-                                        color={result.status === "completed" ? "success" : "warning"}
+                                        color={result.status === "completed" ? "success" : result.status === "failed" ? "error" : "warning"}
                                         sx={{ mb: 2 }}
                                     />
+                                    {result.status === "failed" && (
+                                        <Button
+                                            variant="contained"
+                                            color="error"
+                                            size="small"
+                                            onClick={() => handleRetryAnalysis(result.document_id)}
+                                            sx={{ ml: 2 }}
+                                        >
+                                            Retry Analysis
+                                        </Button>
+                                    )}
                                     <Divider sx={{ my: 1 }} />
                                     <Typography variant="subtitle1" gutterBottom>
                                         Summary:
@@ -294,30 +366,7 @@ function Dashboard() {
                                     ) : (
                                         <Typography>{result.summary || "N/A"}</Typography>
                                     )}
-                                     <Divider sx={{ my: 2 }} />
-                                    {/*<Typography variant="subtitle1">Investment Insights:</Typography>
-                                    {Array.isArray(result.investment_insights) &&
-                                        result.investment_insights.length > 0 ? (
-                                        <ul>
-                                            {result.investment_insights.map((ins, idx) => (
-                                                <li key={idx}>{ins}</li>
-                                            ))}
-                                        </ul>
-                                    ) : (
-                                        <Typography color="text.secondary">None</Typography>
-                                    )}
                                     <Divider sx={{ my: 2 }} />
-                                    <Typography variant="subtitle1">Risk Assessment:</Typography>
-                                    {Array.isArray(result.risk_assessment) &&
-                                        result.risk_assessment.length > 0 ? (
-                                        <ul>
-                                            {result.risk_assessment.map((risk, idx) => (
-                                                <li key={idx}>{risk}</li>
-                                            ))}
-                                        </ul>
-                                    ) : (
-                                        <Typography color="text.secondary">None</Typography>
-                                    )} */}
                                     <Typography variant="subtitle1">Investment Insights:</Typography>
                                     {(() => {
                                         const parsed = parseJsonMaybe(result.investment_insights);
@@ -396,9 +445,6 @@ function Dashboard() {
                                 <TableCell>{a.status}</TableCell>
                                 <TableCell>{new Date(a.created_at).toLocaleString()}</TableCell>
                                 <TableCell>
-                                    {/* <Button variant="outlined" onClick={() => handleExport(result.id, `analysis_${result.id}.pdf`)}>
-                                        Export
-                                    </Button> */}
                                     <Button variant="outlined" onClick={() => handleExport(a.id, `analysis_${a.id}.pdf`)}>
                                         Export
                                     </Button>
