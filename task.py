@@ -3,7 +3,7 @@ from crewai import Task
 from agents import financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler
 from tools import read_financial_document, analyze_investment_tool, create_risk_assessment_tool
 
-## Creating a task to help solve user's query
+# A task to help solve user's query
 analyze_financial_document = Task(
     description=(
         "1. Read and extract the content of the document stored at path {document_path}"
@@ -26,7 +26,7 @@ analyze_financial_document = Task(
     async_execution=False,
 )
 
-## Creating an investment analysis task
+# An investment analysis task
 investment_analysis = Task(
     description=(
         "1. Use the read_financial_document tool to get the document content stored at path {document_path}"
@@ -48,7 +48,7 @@ investment_analysis = Task(
     async_execution=False,
 )
 
-## Creating a risk assessment task
+# A risk assessment task
 risk_assessment = Task(
     description=(
         "1. Read and extract the content of the document stored at path {document_path}"
@@ -79,7 +79,7 @@ risk_assessment = Task(
     async_execution=False,
 )
 
-# Creating a file verification task
+# A file verification task
 verification_task = Task(
     description=(
         "1. Read and extract the content of the document stored at path {document_path}"
@@ -99,8 +99,7 @@ verification_task = Task(
     async_execution=False
 )
 
-
-# final compiler task combines all three
+# Final compiler task to combine all three analysis
 final_report = Task(
     description=(
         "Combine the prior tasks' outputs into one final JSON object ONLY. "

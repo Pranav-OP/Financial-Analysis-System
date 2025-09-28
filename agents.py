@@ -77,6 +77,7 @@ financial_analyst = Agent(
     allow_delegation=False
 )
 
+
 verifier = Agent(
     role="Financial Document Verifier",
     goal="Validate that uploaded files are genuine financial documents and suitable for analysis.",
@@ -98,6 +99,7 @@ verifier = Agent(
     allow_delegation=True
 )
 
+
 investment_advisor = Agent(
     role="Investment Advisor",
     goal="Recommend compliant, balanced, and risk-adjusted investment strategies based on analysis.",
@@ -118,6 +120,7 @@ investment_advisor = Agent(
     allow_delegation=False
 )
 
+
 risk_assessor = Agent(
     role="Risk Management Specialist",
     goal="Identify financial, market, and operational risks from documents and provide mitigation strategies.",
@@ -136,6 +139,7 @@ risk_assessor = Agent(
     max_rpm=10,
     allow_delegation=False
 )
+
 
 document_processor = Agent(
     role="Document Processing Specialist",
@@ -158,7 +162,6 @@ document_processor = Agent(
 )
 
 
-# Report compiler agent
 report_compiler = Agent(
     role="Report Compiler",
     goal="Combine prior agents' outputs into one final JSON object with summary, investment insights, and risk assessment.",

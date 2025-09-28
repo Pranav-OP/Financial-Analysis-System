@@ -2,24 +2,23 @@
 # Imports
 # -----------------------------------------------------------------------------
 import os, io, csv, uuid, shutil, json, re
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
-from bson import ObjectId
-from motor.motor_asyncio import AsyncIOMotorClient
-from typing import Optional, List
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
+from bson import ObjectId
 from crewai import Crew
 from celery_app import app as celery_app
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Body, BackgroundTasks
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi_limiter import FastAPILimiter,RateLimiter
 
+from typing import Optional, List
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 
@@ -47,6 +46,11 @@ crew = Crew(
 # FastAPI APP SETUP
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Financial Document Analyzer")
+
+@app.on_event("startup")
+async def startup():
+    redis = await aioredis.from_url("redis://localhost:6379", encoding="utf8", decode_responses=True)
+    await FastAPILimiter.init(redis)
 
 # Allow CORS for local frontend during development
 app.add_middleware(
@@ -77,7 +81,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 # -----------------------------------------------------------------------------
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client[DB_NAME]
-redis = aioredis.from_url(REDIS_URI, decode_responses=True)
+#redis = aioredis.from_url(REDIS_URI, decode_responses=True)
 
 # -----------------------------------------------------------------------------
 # SECURITY HELPERS
@@ -129,37 +133,6 @@ def require_role(required_roles: List[str]):
         return user
     return role_checker
 
-# -----------------------------------------------------------------------------
-# DOCUMENT STAGING HELPERS
-# -----------------------------------------------------------------------------
-
-UPLOAD_DIR = "data"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# init GridFS bucket 
-gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="documents")
-
-async def stage_file_for_analysis(doc_id: str, filename: str, gridfs_file_id: str) -> str:
-    """Fetch file from GridFS and save locally for analysis."""
-
-    staged_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
-
-    # Open GridFS download stream
-    download_stream = await gridfs_bucket.open_download_stream(ObjectId(gridfs_file_id))
-
-    with open(staged_path, "wb") as f:
-        while True:
-            chunk = await download_stream.readchunk()
-            if not chunk:
-                break
-            f.write(chunk)
-
-    return staged_path
-
-def cleanup_staged_file(path: str):
-    """Remove staged file after analysis."""
-    if os.path.exists(path):
-        os.remove(path)
 
 # -----------------------------------------------------------------------------
 # API ENDPOINTS
@@ -169,7 +142,6 @@ def cleanup_staged_file(path: str):
 async def root():
     """Health check endpoint"""
     return {"message": "Financial Document Analyzer API is running"}
-
 
 # ------------------ AUTH ------------------
 
@@ -336,7 +308,7 @@ async def delete_document(doc_id: str, current_user=Depends(get_current_user)):
 
 # ------------------ ANALYSES ------------------
 
-@app.post("/analyses/{doc_id}")
+@app.post("/analyses/{doc_id}", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
 async def request_analysis(
     doc_id: str,
     req: AnalysisRequest,
@@ -457,7 +429,6 @@ async def get_analysis(analysis_id: str, current_user=Depends(get_current_user))
     )
 
 
-
 @app.get("/analyses", response_model=List[AnalysisResult])
 async def list_analyses(
     document_id: str = None,
@@ -509,85 +480,37 @@ async def export_analysis(analysis_id: str, format: str = "pdf", current_user=De
     else:
         raise HTTPException(400, "Unsupported format")
 
-
 # -----------------------------------------------------------------------------
-# CREW OUTPUT HELPERS
+# DOCUMENT STAGING HELPERS
 # -----------------------------------------------------------------------------
 
-# def _extract_first_json_block(text: str):
-#     """Return first JSON object/dict parsed from a string; supports ```json blocks and bare braces."""
-#     try:
-#         if not isinstance(text, str):
-#             return None
-#         # Prefer fenced json
-#         if "```" in text:
-#             import re, json
+UPLOAD_DIR = "data"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-#             fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-#             for block in fenced:
-#                 block = block.strip()
-#                 if not block:
-#                     continue
-#                 try:
-#                     return json.loads(block)
-#                 except Exception:
-#                     continue
-#         # Fallback: first outermost brace span
-#         import re, json
+# init GridFS bucket 
+gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="documents")
 
-#         m = re.search(r"\{[\s\S]*\}", text)
-#         if m:
-#             return json.loads(m.group(0))
-#     except Exception:
-#         return None
-#     return None
+async def stage_file_for_analysis(doc_id: str, filename: str, gridfs_file_id: str) -> str:
+    """Fetch file from GridFS and save locally for analysis."""
 
+    staged_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
 
-# def _pretty_json(obj):
-#     import json
+    # Open GridFS download stream
+    download_stream = await gridfs_bucket.open_download_stream(ObjectId(gridfs_file_id))
 
-#     try:
-#         return json.dumps(obj, ensure_ascii=False, indent=2)
-#     except Exception:
-#         return str(obj)
+    with open(staged_path, "wb") as f:
+        while True:
+            chunk = await download_stream.readchunk()
+            if not chunk:
+                break
+            f.write(chunk)
 
+    return staged_path
 
-# def _simplify_risk_json(data):
-#     """Normalize to:
-#     {
-#       "assessment_type": "risk_analysis",
-#       "identified_risks": [{ "risk","description","severity","likelihood","strategy" }]
-#     }
-#     """
-#     if not isinstance(data, dict):
-#         return None
-#     out = {"assessment_type": "risk_analysis", "identified_risks": []}
-#     risks = []
-
-#     # Accept common shapes
-#     if isinstance(data.get("identified_risks"), list):
-#         risks = data["identified_risks"]
-#     elif "risks" in data and isinstance(data["risks"], list):
-#         risks = data["risks"]
-
-#     simplified = []
-#     for r in risks:
-#         if not isinstance(r, dict):
-#             continue
-#         simplified.append(
-#             {
-#                 "risk": r.get("risk") or r.get("risk_name") or r.get("name") or "",
-#                 "description": r.get("description") or "",
-#                 "severity": r.get("severity") or "",
-#                 "likelihood": r.get("likelihood") or "",
-#                 "strategy": r.get("strategy")
-#                 or r.get("mitigation")
-#                 or r.get("mitigation_strategy")
-#                 or "",
-#             }
-#         )
-#     out["identified_risks"] = [x for x in simplified if any(v for v in x.values())]
-#     return out
+def cleanup_staged_file(path: str):
+    """Remove staged file after analysis."""
+    if os.path.exists(path):
+        os.remove(path)
 
 # -----------------------------------------------------------------------------
 # EXPORT ANALYSES HELPERS
@@ -829,7 +752,6 @@ def build_analysis_pdf_story(analysis: dict):
         story.append(Paragraph(raw or "No risk assessment.", styles["BodyText"]))
 
     return story
-
 
 # -----------------------------------------------------------------------------
 # ENTRYPOINT

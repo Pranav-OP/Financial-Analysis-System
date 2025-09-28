@@ -205,7 +205,6 @@ function Dashboard() {
     const canUpload = user?.roles.includes("analyst") || user?.roles.includes("admin");
     const canAnalyze = canUpload;
 
-    // helper to safely parse summary if it's JSON inside code block
     const parseSummary = (summary) => {
         if (!summary) return null;
         try {
