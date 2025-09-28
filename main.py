@@ -13,7 +13,8 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Bod
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi_limiter import FastAPILimiter,RateLimiter
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
 
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -159,7 +160,7 @@ async def register(user: UserCreate):
         "username": user.username,
         "password_hash": hashed_pw,
         "full_name": user.full_name,
-        "roles": ["viewer"],
+        "roles": ["analyst"],
         "is_active": True,
         "created_at": datetime.utcnow(),
     }
@@ -239,19 +240,31 @@ async def upload_document(
     )
 
 
-@app.get("/documents", response_model=List[DocumentMeta])
+@app.get("/documents")
 async def list_documents(
     page: int = 1,
-    limit: int = 20,
+    limit: int = 10,
     q: str = None,
     current_user=Depends(get_current_user),
 ):
+    """List documents with pagination and search"""
+    # Validate pagination parameters
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 100:  # Cap maximum limit
+        limit = 10
+    
+    # Build query filter
     query_filter = {}
     if "admin" not in current_user.get("roles", []):
         query_filter = {"uploader_id": current_user["_id"]}
     if q:
         query_filter["filename"] = {"$regex": q, "$options": "i"}
 
+    # Get total count for pagination
+    total_count = await db.documents.count_documents(query_filter)
+    
+    # Get paginated documents
     cursor = (
         db.documents.find(query_filter)
         .sort("created_at", -1)
@@ -260,7 +273,8 @@ async def list_documents(
     )
     docs = await cursor.to_list(limit)
 
-    return [DocumentMeta(
+    # Format response
+    documents = [DocumentMeta(
         id=d["_id"],
         filename=d["filename"],
         status=d["status"],
@@ -269,6 +283,15 @@ async def list_documents(
         created_at=d["created_at"],
     ) for d in docs]
 
+    return {
+        "documents": documents,
+        "total": total_count,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total_count + limit - 1) // limit,  # Ceiling division
+        "has_next": page * limit < total_count,
+        "has_prev": page > 1
+    }
 
 @app.get("/documents/{doc_id}/download")
 async def download_document(doc_id: str, current_user=Depends(get_current_user)):
@@ -429,20 +452,102 @@ async def get_analysis(analysis_id: str, current_user=Depends(get_current_user))
     )
 
 
-@app.get("/analyses", response_model=List[AnalysisResult])
+@app.get("/analyses")
 async def list_analyses(
+    page: int = 1,
+    limit: int = 10,
     document_id: str = None,
     current_user=Depends(get_current_user),
 ):
-    query = {}
+    """List analyses with pagination and filtering"""
+    # Validate pagination parameters
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 100:  # Cap maximum limit
+        limit = 10
+    
+    # Build query filter
+    query_filter = {}
     if document_id:
-        query["document_id"] = document_id
+        query_filter["document_id"] = document_id
+    
+    # Non-admin users can only see their own analyses
     if "admin" not in current_user.get("roles", []):
-        query["uploader_id"] = current_user["_id"]
+        if document_id:
+            # If filtering by document, check if user owns the document
+            doc = await db.documents.find_one(
+                {"_id": document_id, "uploader_id": current_user["_id"]}
+            )
+            if not doc:
+                # User doesn't own this document
+                return {
+                    "analyses": [],
+                    "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "total_pages": 0,
+                    "has_next": False,
+                    "has_prev": False,
+                }
+        else:
+            # Get all documents owned by the user
+            user_doc_ids = []
+            async for doc in db.documents.find(
+                {"uploader_id": current_user["_id"]}, {"_id": 1}
+            ):
+                user_doc_ids.append(doc["_id"])
+            
+            if user_doc_ids:
+                query_filter["document_id"] = {"$in": user_doc_ids}
+            else:
+                return {
+                    "analyses": [],
+                    "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "total_pages": 0,
+                    "has_next": False,
+                    "has_prev": False,
+                }
 
-    cursor = db.analyses.find(query).sort("created_at", -1)
-    analyses = await cursor.to_list(100)
-    return [AnalysisResult(**a, id=str(a["_id"])) for a in analyses]
+    # Get total count for pagination
+    total_count = await db.analyses.count_documents(query_filter)
+    
+    # Get paginated analyses
+    cursor = (
+        db.analyses.find(query_filter)
+        .sort("created_at", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+    )
+    analyses = await cursor.to_list(limit)
+    
+    # Format response
+    analyses_list = [
+        AnalysisResult(
+            id=str(a["_id"]),
+            document_id=a["document_id"],
+            status=a["status"],
+            created_at=a["created_at"],
+            completed_at=a.get("completed_at"),
+            query=a.get("query"),
+            summary=a.get("summary"),
+            investment_insights=a.get("investment_insights"),
+            risk_assessment=a.get("risk_assessment"),
+            raw_excerpt=a.get("raw_excerpt"),
+        )
+        for a in analyses
+    ]
+    
+    return {
+        "analyses": analyses_list,
+        "total": total_count,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total_count + limit - 1) // limit,
+        "has_next": page * limit < total_count,
+        "has_prev": page > 1,
+    }
 
 # ------------------ EXPORT ------------------
 
