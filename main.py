@@ -2,23 +2,24 @@
 # Imports
 # -----------------------------------------------------------------------------
 import os, io, csv, uuid, shutil, json, re
-from motor.motor_asyncio import AsyncIOMotorGridFSBucket
-from bson import ObjectId
-from motor.motor_asyncio import AsyncIOMotorClient
-from typing import Optional, List
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
+from bson import ObjectId
 from crewai import Crew
+from celery_app import app as celery_app
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Body, BackgroundTasks
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
 
+from typing import Optional, List
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 
@@ -27,7 +28,6 @@ from models import (
     DocumentUploadResponse, DocumentListResponse, DocumentMeta,
     AnalysisRequest, AnalysisResult
 )
-from redis_utils import enqueue_analysis_job, get_cache, set_cache
 
 load_dotenv()
 
@@ -47,6 +47,11 @@ crew = Crew(
 # FastAPI APP SETUP
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Financial Document Analyzer")
+
+@app.on_event("startup")
+async def startup():
+    redis = await aioredis.from_url("redis://localhost:6379", encoding="utf8", decode_responses=True)
+    await FastAPILimiter.init(redis)
 
 # Allow CORS for local frontend during development
 app.add_middleware(
@@ -77,7 +82,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 # -----------------------------------------------------------------------------
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db = mongo_client[DB_NAME]
-redis = aioredis.from_url(REDIS_URI, decode_responses=True)
+#redis = aioredis.from_url(REDIS_URI, decode_responses=True)
 
 # -----------------------------------------------------------------------------
 # SECURITY HELPERS
@@ -129,37 +134,6 @@ def require_role(required_roles: List[str]):
         return user
     return role_checker
 
-# -----------------------------------------------------------------------------
-# DOCUMENT STAGING HELPERS
-# -----------------------------------------------------------------------------
-
-UPLOAD_DIR = "data"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# init GridFS bucket 
-gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="documents")
-
-async def stage_file_for_analysis(doc_id: str, filename: str, gridfs_file_id: str) -> str:
-    """Fetch file from GridFS and save locally for analysis."""
-
-    staged_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
-
-    # Open GridFS download stream
-    download_stream = await gridfs_bucket.open_download_stream(ObjectId(gridfs_file_id))
-
-    with open(staged_path, "wb") as f:
-        while True:
-            chunk = await download_stream.readchunk()
-            if not chunk:
-                break
-            f.write(chunk)
-
-    return staged_path
-
-def cleanup_staged_file(path: str):
-    """Remove staged file after analysis."""
-    if os.path.exists(path):
-        os.remove(path)
 
 # -----------------------------------------------------------------------------
 # API ENDPOINTS
@@ -169,7 +143,6 @@ def cleanup_staged_file(path: str):
 async def root():
     """Health check endpoint"""
     return {"message": "Financial Document Analyzer API is running"}
-
 
 # ------------------ AUTH ------------------
 
@@ -187,7 +160,7 @@ async def register(user: UserCreate):
         "username": user.username,
         "password_hash": hashed_pw,
         "full_name": user.full_name,
-        "roles": ["viewer"],
+        "roles": ["analyst"],
         "is_active": True,
         "created_at": datetime.utcnow(),
     }
@@ -249,7 +222,7 @@ async def upload_document(
     doc = {
         "_id": file_id,
         "filename": file.filename,
-        "gridfs_file_id": str(gridfs_file_id),
+        "gridfs_file_id": gridfs_file_id,  # Store as ObjectId, not string
         "uploader_id": current_user["_id"],
         "size_bytes": len(content),
         "status": "uploaded",
@@ -267,19 +240,31 @@ async def upload_document(
     )
 
 
-@app.get("/documents", response_model=List[DocumentMeta])
+@app.get("/documents")
 async def list_documents(
     page: int = 1,
-    limit: int = 20,
+    limit: int = 10,
     q: str = None,
     current_user=Depends(get_current_user),
 ):
+    """List documents with pagination and search"""
+    # Validate pagination parameters
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 100:  # Cap maximum limit
+        limit = 10
+    
+    # Build query filter
     query_filter = {}
     if "admin" not in current_user.get("roles", []):
         query_filter = {"uploader_id": current_user["_id"]}
     if q:
         query_filter["filename"] = {"$regex": q, "$options": "i"}
 
+    # Get total count for pagination
+    total_count = await db.documents.count_documents(query_filter)
+    
+    # Get paginated documents
     cursor = (
         db.documents.find(query_filter)
         .sort("created_at", -1)
@@ -288,7 +273,8 @@ async def list_documents(
     )
     docs = await cursor.to_list(limit)
 
-    return [DocumentMeta(
+    # Format response
+    documents = [DocumentMeta(
         id=d["_id"],
         filename=d["filename"],
         status=d["status"],
@@ -297,6 +283,15 @@ async def list_documents(
         created_at=d["created_at"],
     ) for d in docs]
 
+    return {
+        "documents": documents,
+        "total": total_count,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total_count + limit - 1) // limit,  # Ceiling division
+        "has_next": page * limit < total_count,
+        "has_prev": page > 1
+    }
 
 @app.get("/documents/{doc_id}/download")
 async def download_document(doc_id: str, current_user=Depends(get_current_user)):
@@ -306,7 +301,8 @@ async def download_document(doc_id: str, current_user=Depends(get_current_user))
     if "admin" not in current_user.get("roles", []) and doc["uploader_id"] != current_user["_id"]:
         raise HTTPException(403, "Forbidden")
 
-    grid_out = await gridfs_bucket.open_download_stream(ObjectId(doc["gridfs_file_id"]))
+    # gridfs_file_id is already an ObjectId, no conversion needed
+    grid_out = await gridfs_bucket.open_download_stream(doc["gridfs_file_id"])
 
     async def file_iterator():
         while chunk := await grid_out.readchunk():
@@ -327,136 +323,122 @@ async def delete_document(doc_id: str, current_user=Depends(get_current_user)):
     if "admin" not in current_user.get("roles", []) and doc["uploader_id"] != current_user["_id"]:
         raise HTTPException(403, "Forbidden")
 
-    await gridfs_bucket.delete(ObjectId(doc["gridfs_file_id"]))
+    # gridfs_file_id is already an ObjectId, no conversion needed
+    await gridfs_bucket.delete(doc["gridfs_file_id"])
     await db.documents.delete_one({"_id": doc_id})
     await db.analyses.delete_many({"document_id": doc_id})  # cleanup analyses
     return {"status": "deleted"}
 
 # ------------------ ANALYSES ------------------
 
-@app.post("/analyses/{doc_id}", response_model=AnalysisResult)
+@app.post("/analyses/{doc_id}", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
 async def request_analysis(
     doc_id: str,
-    req: AnalysisRequest = Body(...),
-    background_tasks: BackgroundTasks = None,
-    current_user=Depends(get_current_user)
+    req: AnalysisRequest,
+    current_user: dict = Depends(get_current_user)
 ):
-    """Run analysis immediately without queueing"""
-
-    # Check if user is admin
-    is_admin = "admin" in current_user.get("roles", [])
-    
-    # Check if document exists and belongs to user (Exception : admin)
-    query_filter = {"_id": doc_id} if is_admin else {"_id": doc_id, "uploader_id": current_user["_id"]}
+    """Start a background analysis job"""
+    # Check access
+    query_filter = {"_id": doc_id}
+    if "admin" not in current_user.get("roles", []):
+        query_filter["uploader_id"] = current_user["_id"]
 
     doc = await db.documents.find_one(query_filter)
     if not doc:
         raise HTTPException(404, "Document not found or access denied")
 
-    # Stage file for analysis
-    try:
-        staged_path = await stage_file_for_analysis(doc_id, doc["filename"], doc["gridfs_file_id"])
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
+    from celery_tasks import process_analysis_task
 
-    try:
-        # Single Crew run with 4 tasks
-        result = crew.kickoff(inputs={"document_path": staged_path, "query": req.query})
+    # Start Celery task
+    task = process_analysis_task.delay(doc_id, req.query)
 
-        print(f" ----- CREW FINAL RESULT ----- \n {result}")
-
-        out_text = getattr(result, "raw", None) or getattr(result, "output", None) or str(result)
-
-        def _first_json(text: str):
-            if not isinstance(text, str): return None
-            # fenced first
-            if "```" in text:
-                blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-                for b in blocks:
-                    try: return json.loads(b.strip())
-                    except: pass
-            m = re.search(r"\{[\s\S]*\}", text)
-            if m:
-                try: return json.loads(m.group(0))
-                except: return None
-            return None
-
-        combined = _first_json(out_text) or {}
-        summary_val = combined.get("summary")
-        investment_val = combined.get("investment_insights")
-        risk_val = combined.get("risk_assessment")
-
-        # summary pretty string
-        if isinstance(summary_val, (dict, list)):
-            summary = json.dumps(summary_val, ensure_ascii=False, indent=2)
-        else:
-            summary = str(summary_val) if summary_val is not None else "No summary produced."
-
-        # investment insights pretty string
-        if investment_val is not None:
-            investment_insights = json.dumps(investment_val, ensure_ascii=False, indent=2) \
-                if isinstance(investment_val, (dict, list)) else str(investment_val)
-        else:
-            investment_insights = None
-
-        # risk assessment pretty string
-        if risk_val is not None:
-            risk_assessment = json.dumps(risk_val, ensure_ascii=False, indent=2) \
-                if isinstance(risk_val, (dict, list)) else str(risk_val)
-        else:
-            risk_assessment = None
-
-    except Exception as e:
-        cleanup_staged_file(staged_path)
-        raise HTTPException(500, f"Analysis failed: {str(e)}")
-
-    if background_tasks:
-        background_tasks.add_task(cleanup_staged_file, staged_path)
-    else:
-        cleanup_staged_file(staged_path)
-
-    analysis_id = str(uuid.uuid4())
-
-    analysis_doc = {
-        "_id": analysis_id,
+    # Insert job entry in Mongo
+    job_entry = {
+        "job_id": task.id,
         "document_id": doc_id,
-        "status": "completed",
-        "query": req.query,
-        "summary": summary,
-        "investment_insights": investment_insights, 
-        "risk_assessment": risk_assessment,
+        "user_id": current_user["_id"],
+        "status": "queued",
         "created_at": datetime.utcnow(),
-        "completed_at": datetime.utcnow()
+        "updated_at": datetime.utcnow()
     }
-    await db.analyses.insert_one(analysis_doc)
+    await db.jobs.insert_one(job_entry)
 
-    return AnalysisResult(
-        id=analysis_id,
-        document_id=doc_id,
-        status="completed",
-        created_at=analysis_doc["created_at"],
-        completed_at=analysis_doc["completed_at"],
-        query=analysis_doc["query"],
-        summary=analysis_doc["summary"],
-        investment_insights=analysis_doc["investment_insights"],
-        risk_assessment=analysis_doc["risk_assessment"],
-        #raw_excerpt=analysis_doc["raw_excerpt"]
+    return {
+        "job_id": task.id,
+        "status": "queued",
+        "message": "Analysis started. Use job_id to check status."
+    }
+
+
+@app.get("/analyses/job/{job_id}")
+async def get_job_status(job_id: str):
+    """Get the status of a background analysis job from Mongo"""
+
+    job = await db.jobs.find_one({"job_id": job_id})
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    response = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+    }
+
+    if job.get("analysis_id"):
+        response["analysis_id"] = job["analysis_id"]
+    if job.get("error"):
+        response["error"] = job["error"]
+
+    return response
+
+
+@app.get("/analyses/status/{doc_id}")
+async def check_analysis_status(doc_id: str, current_user=Depends(get_current_user)):
+    """Check if analysis is complete by looking in database"""
+    
+    # Check if user is admin
+    is_admin = "admin" in current_user.get("roles", [])
+    
+    # Find the most recent analysis for this document
+    query_filter = {"document_id": doc_id}
+    if not is_admin:
+        query_filter["user_id"] = current_user["_id"]
+    
+    analysis = await db.analyses.find_one(
+        query_filter,
+        sort=[("created_at", -1)]
     )
-   
+    
+    if not analysis:
+        return {"status": "not_found", "message": "No analysis found for this document"}
+    
+    return {
+        "status": analysis["status"],
+        "analysis_id": str(analysis["_id"]),
+        "message": "Analysis found" if analysis["status"] == "completed" else "Analysis in progress"
+    }
+
 
 @app.get("/analyses/{analysis_id}", response_model=AnalysisResult)
-async def get_analysis(analysis_id: str):
-    
-    # cache = get_cache(f"analysis:{analysis_id}")
-    # if cache:
-    #     return AnalysisResult(**cache)
+async def get_analysis(analysis_id: str, current_user=Depends(get_current_user)):
+    """Get analysis result by ID or by job ID"""
 
-    db = mongo_client[DB_NAME]
-    analysis = db.analyses.find_one({"_id": ObjectId(analysis_id)})
+    # 🔹 Check if it's actually a job_id
+    job = await db.jobs.find_one({"job_id": analysis_id})
+    if job and job.get("analysis_id"):
+        analysis_id = job["analysis_id"]
+
+    # Now fetch the real analysis
+    analysis = await db.analyses.find_one({"_id": analysis_id})
     if not analysis:
         raise HTTPException(404, "Analysis not found")
 
-    result = AnalysisResult(
+    # Permission check
+    if "admin" not in current_user.get("roles", []) and analysis.get("user_id") != current_user["_id"]:
+        raise HTTPException(403, "Access denied")
+
+    return AnalysisResult(
         id=str(analysis["_id"]),
         document_id=analysis["document_id"],
         status=analysis["status"],
@@ -464,30 +446,108 @@ async def get_analysis(analysis_id: str):
         completed_at=analysis.get("completed_at"),
         query=analysis.get("query"),
         summary=analysis.get("summary"),
-        investment_insights=analysis.get("investment_insights", []),
-        risk_assessment=analysis.get("risk_assessment", []),
+        investment_insights=analysis.get("investment_insights"),
+        risk_assessment=analysis.get("risk_assessment"),
         raw_excerpt=analysis.get("raw_excerpt")
     )
 
-    # set cache
-    # set_cache(f"analysis:{analysis_id}", result.dict())
-    return result
 
-
-@app.get("/analyses", response_model=List[AnalysisResult])
+@app.get("/analyses")
 async def list_analyses(
+    page: int = 1,
+    limit: int = 10,
     document_id: str = None,
     current_user=Depends(get_current_user),
 ):
-    query = {}
+    """List analyses with pagination and filtering"""
+    # Validate pagination parameters
+    if page < 1:
+        page = 1
+    if limit < 1 or limit > 100:  # Cap maximum limit
+        limit = 10
+    
+    # Build query filter
+    query_filter = {}
     if document_id:
-        query["document_id"] = document_id
+        query_filter["document_id"] = document_id
+    
+    # Non-admin users can only see their own analyses
     if "admin" not in current_user.get("roles", []):
-        query["uploader_id"] = current_user["_id"]
+        if document_id:
+            # If filtering by document, check if user owns the document
+            doc = await db.documents.find_one(
+                {"_id": document_id, "uploader_id": current_user["_id"]}
+            )
+            if not doc:
+                # User doesn't own this document
+                return {
+                    "analyses": [],
+                    "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "total_pages": 0,
+                    "has_next": False,
+                    "has_prev": False,
+                }
+        else:
+            # Get all documents owned by the user
+            user_doc_ids = []
+            async for doc in db.documents.find(
+                {"uploader_id": current_user["_id"]}, {"_id": 1}
+            ):
+                user_doc_ids.append(doc["_id"])
+            
+            if user_doc_ids:
+                query_filter["document_id"] = {"$in": user_doc_ids}
+            else:
+                return {
+                    "analyses": [],
+                    "total": 0,
+                    "page": page,
+                    "limit": limit,
+                    "total_pages": 0,
+                    "has_next": False,
+                    "has_prev": False,
+                }
 
-    cursor = db.analyses.find(query).sort("created_at", -1)
-    analyses = await cursor.to_list(100)
-    return [AnalysisResult(**a, id=a["_id"]) for a in analyses]
+    # Get total count for pagination
+    total_count = await db.analyses.count_documents(query_filter)
+    
+    # Get paginated analyses
+    cursor = (
+        db.analyses.find(query_filter)
+        .sort("created_at", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+    )
+    analyses = await cursor.to_list(limit)
+    
+    # Format response
+    analyses_list = [
+        AnalysisResult(
+            id=str(a["_id"]),
+            document_id=a["document_id"],
+            status=a["status"],
+            created_at=a["created_at"],
+            completed_at=a.get("completed_at"),
+            query=a.get("query"),
+            summary=a.get("summary"),
+            investment_insights=a.get("investment_insights"),
+            risk_assessment=a.get("risk_assessment"),
+            raw_excerpt=a.get("raw_excerpt"),
+        )
+        for a in analyses
+    ]
+    
+    return {
+        "analyses": analyses_list,
+        "total": total_count,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total_count + limit - 1) // limit,
+        "has_next": page * limit < total_count,
+        "has_prev": page > 1,
+    }
 
 # ------------------ EXPORT ------------------
 
@@ -525,85 +585,37 @@ async def export_analysis(analysis_id: str, format: str = "pdf", current_user=De
     else:
         raise HTTPException(400, "Unsupported format")
 
-
 # -----------------------------------------------------------------------------
-# CREW OUTPUT HELPERS
+# DOCUMENT STAGING HELPERS
 # -----------------------------------------------------------------------------
 
-# def _extract_first_json_block(text: str):
-#     """Return first JSON object/dict parsed from a string; supports ```json blocks and bare braces."""
-#     try:
-#         if not isinstance(text, str):
-#             return None
-#         # Prefer fenced json
-#         if "```" in text:
-#             import re, json
+UPLOAD_DIR = "data"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-#             fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-#             for block in fenced:
-#                 block = block.strip()
-#                 if not block:
-#                     continue
-#                 try:
-#                     return json.loads(block)
-#                 except Exception:
-#                     continue
-#         # Fallback: first outermost brace span
-#         import re, json
+# init GridFS bucket 
+gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="documents")
 
-#         m = re.search(r"\{[\s\S]*\}", text)
-#         if m:
-#             return json.loads(m.group(0))
-#     except Exception:
-#         return None
-#     return None
+async def stage_file_for_analysis(doc_id: str, filename: str, gridfs_file_id: str) -> str:
+    """Fetch file from GridFS and save locally for analysis."""
 
+    staged_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
 
-# def _pretty_json(obj):
-#     import json
+    # Open GridFS download stream
+    download_stream = await gridfs_bucket.open_download_stream(ObjectId(gridfs_file_id))
 
-#     try:
-#         return json.dumps(obj, ensure_ascii=False, indent=2)
-#     except Exception:
-#         return str(obj)
+    with open(staged_path, "wb") as f:
+        while True:
+            chunk = await download_stream.readchunk()
+            if not chunk:
+                break
+            f.write(chunk)
 
+    return staged_path
 
-# def _simplify_risk_json(data):
-#     """Normalize to:
-#     {
-#       "assessment_type": "risk_analysis",
-#       "identified_risks": [{ "risk","description","severity","likelihood","strategy" }]
-#     }
-#     """
-#     if not isinstance(data, dict):
-#         return None
-#     out = {"assessment_type": "risk_analysis", "identified_risks": []}
-#     risks = []
-
-#     # Accept common shapes
-#     if isinstance(data.get("identified_risks"), list):
-#         risks = data["identified_risks"]
-#     elif "risks" in data and isinstance(data["risks"], list):
-#         risks = data["risks"]
-
-#     simplified = []
-#     for r in risks:
-#         if not isinstance(r, dict):
-#             continue
-#         simplified.append(
-#             {
-#                 "risk": r.get("risk") or r.get("risk_name") or r.get("name") or "",
-#                 "description": r.get("description") or "",
-#                 "severity": r.get("severity") or "",
-#                 "likelihood": r.get("likelihood") or "",
-#                 "strategy": r.get("strategy")
-#                 or r.get("mitigation")
-#                 or r.get("mitigation_strategy")
-#                 or "",
-#             }
-#         )
-#     out["identified_risks"] = [x for x in simplified if any(v for v in x.values())]
-#     return out
+def cleanup_staged_file(path: str):
+    """Remove staged file after analysis."""
+    if os.path.exists(path):
+        os.remove(path)
 
 # -----------------------------------------------------------------------------
 # EXPORT ANALYSES HELPERS
@@ -845,7 +857,6 @@ def build_analysis_pdf_story(analysis: dict):
         story.append(Paragraph(raw or "No risk assessment.", styles["BodyText"]))
 
     return story
-
 
 # -----------------------------------------------------------------------------
 # ENTRYPOINT
