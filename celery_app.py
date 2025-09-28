@@ -7,7 +7,7 @@ load_dotenv()
 # Redis URL for Celery broker
 REDIS_URL = os.getenv("REDIS_URI", "redis://localhost:6379")
 
-# Create Celery instance (remove result backend to avoid serialization issues)
+# Create Celery instance
 app = Celery(
     "financial_analyzer",
     broker=REDIS_URL,

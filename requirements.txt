@@ -57,6 +57,7 @@ embedchain==0.1.128
 et_xmlfile==2.0.0
 executing==2.2.1
 fastapi==0.117.1
+fastapi-limiter==0.1.6
 fastavro==1.12.0
 filelock==3.19.1
 filetype==1.2.0
