@@ -149,7 +149,7 @@ def process_analysis_task(self, doc_id, query="Analyze this financial document")
 
         # Run CrewAI pipeline
         from main import crew
-        result = crew.kickoff(inputs={"document_path": staged_path, "query": query}, tasks=[final_report])
+        result = crew.kickoff(inputs={"document_path": staged_path, "query": query})
 
         out_text = getattr(result, "raw", None) or getattr(result, "output", None) or str(result)
 

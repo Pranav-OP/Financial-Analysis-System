@@ -5,7 +5,7 @@ import os, io, csv, uuid, shutil, json, re
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from bson import ObjectId
-from crewai import Crew
+from crewai import Crew, Process
 from celery_app import app as celery_app
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 
@@ -40,7 +40,8 @@ from task import analyze_financial_document, investment_analysis, risk_assessmen
 
 crew = Crew(
     agents=[financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler],
-    tasks=[verification_task, analyze_financial_document, investment_analysis, risk_assessment, final_report]
+    tasks=[verification_task, analyze_financial_document, investment_analysis, risk_assessment, final_report],
+    #process = Process.sequential
 )
 
 # -----------------------------------------------------------------------------
@@ -67,7 +68,7 @@ app.add_middleware(
 # -----------------------------------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "finanalyzer")
-REDIS_URI = os.getenv("REDIS_URI", "redis://localhost:6379")
+#REDIS_URI = os.getenv("REDIS_URI", "redis://localhost:6379")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "supersecret")
 
 JWT_ALGORITHM = "HS256"

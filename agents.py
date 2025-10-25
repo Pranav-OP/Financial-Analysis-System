@@ -20,6 +20,12 @@ os.environ["GEMINI_API_KEY"] = GOOGLE_API_KEY
 if not GOOGLE_API_KEY:
     raise ValueError("Google API key not found in environment variables")
 
+# from crewai import LLM
+# llm = LLM(
+#     model="gemini/gemini-2.0-flash",
+#     temperature=0.3
+# )
+
 # Create a LiteLLM wrapper class for CrewAI compatibility
 class LiteLLMWrapper:
     def __init__(self, model_name, temperature=0.3):
