@@ -32,3 +32,19 @@ app.conf.update(
     task_ignore_result=True,
     result_expires=3600,
 )
+
+# commands to run the project
+# npm run dev
+# uvicorn main:app --reload
+# celery -A celery_app worker --loglevel=info --pool=solo
+# sudo service redis-server start
+
+# .env file (backend configuration)
+# MONGO_URI=mongodb://localhost:27017
+# DB_NAME=finanalyzer
+# REDIS_URI=redis://localhost:6379
+# JWT_SECRET_KEY=wingifysecret007
+# GOOGLE_API_KEY = AIzaSyBz9fKsAXuCAXYv7R6beFEqZ7-c3skVH3A # preetiprissoft
+
+# .env file (frontend configuration)
+# VITE_API_URL=http://localhost:8000
