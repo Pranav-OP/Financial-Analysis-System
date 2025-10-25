@@ -44,7 +44,7 @@ app.conf.update(
 # DB_NAME=finanalyzer
 # REDIS_URI=redis://localhost:6379
 # JWT_SECRET_KEY=wingifysecret007
-# GOOGLE_API_KEY = AIzaSyBz9fKsAXuCAXYv7R6beFEqZ7-c3skVH3A # preetiprissoft
+# GOOGLE_API_KEY =  #2 XuCAXYv7R #4 c3skVH3A #1 AIzaSyBz9fKsA #3 6beFEqZ7-
 
 # .env file (frontend configuration)
 # VITE_API_URL=http://localhost:8000
