@@ -27,8 +27,8 @@ app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     # Remove result backend to avoid serialization issues
-    result_backend=None,
+    result_backend=None, # Explicitly disables storing task results in backend (Redis)
     # Disable result persistence
-    result_expires=3600,
     task_ignore_result=True,
+    result_expires=3600,
 )
