@@ -2,6 +2,7 @@
 # Imports
 # -----------------------------------------------------------------------------
 import os, io, csv, uuid, shutil, json, re
+from contextlib import asynccontextmanager
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
 from bson import ObjectId
@@ -35,24 +36,45 @@ load_dotenv()
 # CrewAI SETUP
 # -----------------------------------------------------------------------------
 
-from agents import financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler
-from task import analyze_financial_document, investment_analysis, risk_assessment, verification_task, final_report
+from agents import financial_analyst, verifier, investment_advisor, risk_assessor
+from task import analyze_financial_document, investment_analysis, risk_assessment, verification_task
 
+import time
+
+# Small safety pacing for free-tier per-minute token caps (Groq = 12k TPM). With the
+# retrieve-then-generate design each agent makes a single tool-free call (~7k tokens for
+# the whole run), so only a light spread is needed. step_callback runs after every agent
+# step and blocks. Raise STEP_DELAY_SECONDS if you ever hit 429s; set it to 0 for full speed.
+STEP_DELAY_SECONDS = float(os.getenv("STEP_DELAY_SECONDS", "7"))
+
+def _pace_step(_step_output=None):
+    if STEP_DELAY_SECONDS > 0:
+        time.sleep(STEP_DELAY_SECONDS)
+
+# NOTE: the final "combine into one JSON" step is done in Python (see celery_tasks)
+# instead of via an LLM agent — merging three JSON blobs is pure data assembly, and
+# spending an LLM call on it wasted the largest prompt of the run.
 crew = Crew(
-    agents=[financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler],
-    tasks=[verification_task, analyze_financial_document, investment_analysis, risk_assessment, final_report],
-    #process = Process.sequential
+    agents=[verifier, financial_analyst, investment_advisor, risk_assessor],
+    tasks=[verification_task, analyze_financial_document, investment_analysis, risk_assessment],
+    process=Process.sequential,
+    step_callback=_pace_step,
 )
 
 # -----------------------------------------------------------------------------
 # FastAPI APP SETUP
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Financial Document Analyzer")
-
-@app.on_event("startup")
-async def startup():
-    redis = await aioredis.from_url("redis://localhost:6379", encoding="utf8", decode_responses=True)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: init the Redis-backed rate limiter
+    redis_uri = os.getenv("REDIS_URI", "redis://localhost:6379")
+    redis = await aioredis.from_url(redis_uri, encoding="utf8", decode_responses=True)
     await FastAPILimiter.init(redis)
+    yield
+    # Shutdown
+    await FastAPILimiter.close()
+
+app = FastAPI(title="Financial Document Analyzer", lifespan=lifespan)
 
 # Allow CORS for local frontend during development
 app.add_middleware(
@@ -72,8 +94,12 @@ DB_NAME = os.getenv("DB_NAME", "finanalyzer")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "supersecret")
 
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 15
-REFRESH_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
+
+# Upload constraints (server-side validation — never trust the client)
+ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".csv", ".png", ".jpg", ".jpeg", ".txt"}
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))  # 50 MB default
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
@@ -190,6 +216,35 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
 
 
+@app.post("/auth/refresh", response_model=Token)
+async def refresh_access_token(payload: dict = Body(...)):
+    """Exchange a valid refresh token for a fresh access + refresh token pair."""
+    token = payload.get("refresh_token")
+    if not token:
+        raise HTTPException(status_code=400, detail="refresh_token is required")
+
+    credentials_exception = HTTPException(status_code=401, detail="Invalid refresh token")
+    try:
+        claims = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise credentials_exception
+
+    if claims.get("scope") != "refresh_token":
+        raise credentials_exception
+
+    user_id = claims.get("sub")
+    user = await db.users.find_one({"_id": user_id}) if user_id else None
+    if not user:
+        raise credentials_exception
+
+    new_claims = {"sub": user["_id"], "roles": user.get("roles", [])}
+    return {
+        "access_token": create_access_token(new_claims),
+        "token_type": "bearer",
+        "refresh_token": create_refresh_token(new_claims),
+    }
+
+
 @app.get("/auth/me", response_model=UserOut)
 async def get_current_user_info(current_user=Depends(get_current_user)):
     """
@@ -214,8 +269,24 @@ async def upload_document(
 ):
     """Upload a financial document (PDF, DOCX, XLSX, CSV, Image)"""
 
+    # --- Validate file type and size (server-side) ---
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext or 'unknown'}'. Allowed: {sorted(ALLOWED_UPLOAD_EXTENSIONS)}",
+        )
+
     file_id = str(uuid.uuid4())
     content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(content)} bytes). Max allowed is {MAX_UPLOAD_BYTES} bytes.",
+        )
 
     # Save file into GridFS
     gridfs_file_id = await gridfs_bucket.upload_from_stream(file.filename, content)
@@ -593,30 +664,10 @@ async def export_analysis(analysis_id: str, format: str = "pdf", current_user=De
 UPLOAD_DIR = "data"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# init GridFS bucket 
+# init GridFS bucket
 gridfs_bucket = AsyncIOMotorGridFSBucket(db, bucket_name="documents")
 
-async def stage_file_for_analysis(doc_id: str, filename: str, gridfs_file_id: str) -> str:
-    """Fetch file from GridFS and save locally for analysis."""
-
-    staged_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
-
-    # Open GridFS download stream
-    download_stream = await gridfs_bucket.open_download_stream(ObjectId(gridfs_file_id))
-
-    with open(staged_path, "wb") as f:
-        while True:
-            chunk = await download_stream.readchunk()
-            if not chunk:
-                break
-            f.write(chunk)
-
-    return staged_path
-
-def cleanup_staged_file(path: str):
-    """Remove staged file after analysis."""
-    if os.path.exists(path):
-        os.remove(path)
+# NOTE: file staging for analysis is handled inside celery_tasks.process_analysis_task (the Celery worker uses a synchronous GridFS client), so no async staging helper is needed here.
 
 # -----------------------------------------------------------------------------
 # EXPORT ANALYSES HELPERS
