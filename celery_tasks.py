@@ -1,6 +1,9 @@
 from celery_app import app
-from tools import read_financial_document, analyze_investment_tool, create_risk_assessment_tool
-from task import final_report
+# Import project modules at top level so they resolve during worker startup (when the
+# project root is on sys.path). A lazy import inside the task fails on some Celery/
+# Windows setups because the worker's sys.path no longer includes the cwd at run time.
+from tools import read_financial_document, search_financial_document
+from main import crew
 from pymongo import MongoClient
 from gridfs import GridFS
 from bson import ObjectId
@@ -147,42 +150,60 @@ def process_analysis_task(self, doc_id, query="Analyze this financial document")
         with open(staged_path, "wb") as f:
             f.write(file_obj.read())
 
+        # Retrieve-then-generate: pull the relevant passages ONCE (local RAG) and inject
+        # them into the crew, so each agent makes a single tool-free LLM call.
+        doc_preview = read_financial_document.func(staged_path)
+        financial_context = search_financial_document.func(
+            staged_path, "revenue, profit, gross margin, operating income, expenses, cash flow, guidance, growth"
+        )
+        risk_context = search_financial_document.func(
+            staged_path, "risks, litigation, regulatory, debt, liquidity, competition, supply chain, uncertainty"
+        )
+
         # Run CrewAI pipeline
-        from main import crew
-        result = crew.kickoff(inputs={"document_path": staged_path, "query": query})
+        result = crew.kickoff(inputs={
+            "document_path": staged_path,
+            "query": query,
+            "doc_preview": doc_preview,
+            "financial_context": financial_context,
+            "risk_context": risk_context,
+        })
 
-        out_text = getattr(result, "raw", None) or getattr(result, "output", None) or str(result)
-
-        def _first_json(text: str):
+        def _first_json(text):
+            """Best-effort parse of a JSON object out of an LLM's raw text output."""
+            if isinstance(text, (dict, list)):
+                return text
             if not isinstance(text, str):
                 return None
-            # fenced code blocks first
-            if "```" in text:
-                blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-                for b in blocks:
+            if "```" in text:  # fenced code blocks first
+                for b in re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE):
                     try:
                         return json.loads(b.strip())
                     except Exception:
                         continue
-            # fallback: first {...}
-            m = re.search(r"\{[\s\S]*\}", text)
+            m = re.search(r"\{[\s\S]*\}", text)  # first {...} block
             if m:
                 try:
                     return json.loads(m.group(0))
                 except Exception:
-                    return None
-            # last resort: parse full text
+                    pass
             try:
                 return json.loads(text)
             except Exception:
                 return None
 
-        combined = _first_json(out_text) or {}
+        # Assemble the final result in Python from each task's output instead of a
+        # dedicated LLM "compiler" call. Task order matches main.crew.tasks:
+        #   0 = verification, 1 = analysis, 2 = investment, 3 = risk
+        def _task_raw(idx):
+            outs = getattr(result, "tasks_output", None) or []
+            if 0 <= idx < len(outs):
+                return getattr(outs[idx], "raw", None) or str(outs[idx])
+            return None
 
-        # Extract + pretty format fields
-        summary_val = combined.get("summary")
-        investment_val = combined.get("investment_insights")
-        risk_val = combined.get("risk_assessment")
+        summary_val = _first_json(_task_raw(1)) or _task_raw(1)
+        investment_val = _first_json(_task_raw(2)) or _task_raw(2)
+        risk_val = _first_json(_task_raw(3)) or _task_raw(3)
 
         # summary
         if isinstance(summary_val, (dict, list)):

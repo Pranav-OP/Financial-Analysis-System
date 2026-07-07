@@ -39,12 +39,5 @@ app.conf.update(
 # celery -A celery_app worker --loglevel=info --pool=solo
 # sudo service redis-server start
 
-# .env file (backend configuration)
-# MONGO_URI=mongodb://localhost:27017
-# DB_NAME=finanalyzer
-# REDIS_URI=redis://localhost:6379
-# JWT_SECRET_KEY=wingifysecret007
-# GOOGLE_API_KEY =  #2 XuCAXYv7R #4 c3skVH3A #1 AIzaSyBz9fKsA #3 6beFEqZ7-
-
-# .env file (frontend configuration)
-# VITE_API_URL=http://localhost:8000
+# See .env.example for the required environment variables (backend + frontend).
+# Never commit real API keys or secrets — keep them only in your local .env.
