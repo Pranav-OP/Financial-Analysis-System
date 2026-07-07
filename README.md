@@ -11,10 +11,14 @@ You can see a live demonstration of the system's functionality here:
 
 ## ✨ Features
 
-* **Asynchronous Processing:** Utilizes **Celery** to offload long-running financial calculations and analysis tasks, ensuring the main API remains responsive.
-* **Modern UI/UX:** Built with **React** and **MaterialUI** to provide a clean, intuitive, and mobile-responsive interface.
-* **Data Persistence:** Stores and retrieves structured financial data using a **MongoDB** document database.
-* **High-Speed Caching:** Employs **Redis** for managing queues for Celery tasks and for high-speed caching of temporary or frequently accessed data.
+* **Multi-Agent AI Analysis:** A **CrewAI** pipeline of specialist agents (verifier → analyst → investment advisor → risk specialist → compiler) produces a financial summary, investment insights, and a risk matrix.
+* **Retrieval-Augmented Generation (RAG):** Documents are chunked, embedded, and indexed in **ChromaDB**; agents retrieve only the passages relevant to each question instead of stuffing whole PDFs into the prompt. Scales to large filings and keeps answers grounded in the source.
+* **Local, free embeddings by default:** Embeddings run **offline** via ChromaDB's built-in MiniLM model — no API key or quota required. Swappable to Gemini embeddings via one env var.
+* **Swappable LLM provider:** Chat runs on **Groq** (generous free tier) or **Google Gemini**, selected with a single `LLM_MODEL` env variable — no code changes.
+* **Asynchronous Processing:** Utilizes **Celery** to offload long-running analysis tasks, keeping the API responsive; the frontend polls for completion.
+* **Modern UI/UX:** Built with **React** and **MaterialUI** — light/dark mode, structured result rendering (metric grids, risk tables), and PDF export.
+* **Security:** JWT auth with refresh tokens, role-based access control, rate limiting, and server-side upload validation.
+* **Data Persistence:** Stores users, documents (via **GridFS**), jobs, and analyses in a **MongoDB** document database.
 * **Scalable Backend:** The API is built with **FastAPI** and served by **Uvicorn**, providing high performance and robust data validation.
 
 ---
@@ -27,12 +31,18 @@ This project is built using a modern, decoupled architecture:
 | :--- | :--- | :--- |
 | **Backend Language** | **Python** | Primary development language for backend logic. |
 | **API Framework** | **FastAPI** & **Uvicorn** | High-performance API server. |
-| **Database** | **MongoDB** | NoSQL database for data storage. |
-| **Caching/Broker** | **Redis** | Message broker for Celery and caching (installed via WSL2 on Windows). |
+| **AI Orchestration** | **CrewAI** | Coordinates the multi-agent analysis pipeline. |
+| **Chat LLM** | **Groq** (default) / **Google Gemini** | The reasoning engine, selected via `LLM_MODEL`. |
+| **Embeddings** | **ChromaDB MiniLM** (local) / **Gemini** | Turn text into vectors for RAG retrieval. |
+| **Vector DB** | **ChromaDB** | Stores document embeddings for similarity search. |
+| **Database** | **MongoDB** | NoSQL database + **GridFS** for file storage. |
+| **Caching/Broker** | **Redis** | Message broker for Celery + rate-limiter backend. |
 | **Worker** | **Celery** | Distributed task queue for asynchronous jobs. |
-| **Frontend Framework** | **React** & **JavaScript** | Library for building the user interface. |
+| **Frontend Framework** | **React** & **Vite** | Library/build tool for the user interface. |
 | **Styling** | **MaterialUI** | Component library for polished design. |
 | **Dependencies** | `requirements.txt` | Defines all necessary Python packages. |
+
+> 📐 For a full walkthrough of the flow and the concepts (RAG, embeddings, agents, async queues, JWT…), see **[ARCHITECTURE.md](./ARCHITECTURE.md)**.
 
 ---
 
@@ -67,7 +77,37 @@ Install Python Dependencies:
 pip install -r requirements.txt
 ```
 
-### Step 3: Start Redis Server
+### Step 3: Configure Environment Variables
+
+Copy the example file and fill in your values:
+```bash
+cp .env.example .env          # Windows PowerShell: copy .env.example .env
+```
+
+Key settings in `.env`:
+
+| Variable | Purpose | Default |
+| :--- | :--- | :--- |
+| `LLM_MODEL` | Chat model. `groq/llama-3.3-70b-versatile` (recommended) or `gemini/gemini-2.5-flash`. | `gemini/gemini-2.5-flash` |
+| `GROQ_API_KEY` | Required if `LLM_MODEL` is a `groq/*` model. Get one at [console.groq.com/keys](https://console.groq.com/keys). | — |
+| `GOOGLE_API_KEY` | Required only for Gemini chat **or** `EMBED_PROVIDER=gemini`. | — |
+| `EMBED_PROVIDER` | `local` (offline, free — no key needed) or `gemini`. | `local` |
+| `JWT_SECRET_KEY` | Secret for signing auth tokens — use a long random string. | — |
+| `MONGO_URI`, `REDIS_URI` | Database + broker connections. | localhost |
+
+Also set the frontend API URL in `finanalyzerUI/.env`:
+```bash
+VITE_API_URL=http://localhost:8000
+```
+
+> **Free-tier note:** Groq's free tier caps *tokens per minute*. If a large document
+> trips the limit, the pipeline auto-retries (`LLM_NUM_RETRIES`); just wait ~60s and
+> re-run if needed. Local embeddings avoid Gemini quota entirely.
+
+> On the first analysis, `EMBED_PROVIDER=local` downloads a small (~80MB) embedding
+> model once and caches it — subsequent runs are instant.
+
+### Step 4: Start Redis Server
 The system requires a running Redis instance. If you are using Windows with WSL2/Ubuntu, run the following commands in your WSL terminal:
 
 Start the Redis Service:
@@ -75,23 +115,23 @@ Start the Redis Service:
 sudo service redis-server start
 ```
 
-### Step 4: Run Backend API
+### Step 5: Run Backend API
 Ensure your virtual environment is active. This starts the FastAPI application:
 ```bash
 uvicorn main:app --reload
 ```
 
-The API is now running, typically at http://127.0.0.1:8000.
+The API is now running, typically at http://127.0.0.1:8000 (interactive docs at `/docs`).
 
-### Step 5: Run Celery Worker
+### Step 6: Run Celery Worker
 Open a NEW terminal window (keep the API terminal running) and activate your virtual environment again. The Celery worker handles background processing:
 
 ```bash
 celery -A celery_app worker --loglevel=info --pool=solo
 ```
 
-Step 6: Run Frontend
-You will need Node.js and npm installed. Run these commands from the directory containing the package.json file (typically the root or a client/frontend subdirectory—confirm location based on your repo structure):
+### Step 7: Run Frontend
+You will need Node.js and npm installed. Run these commands from the `finanalyzerUI/` directory (where `package.json` lives):
 
 Install Node Dependencies:
 ```bash
@@ -103,4 +143,4 @@ Start the Frontend Development Server:
 npm run dev
 ```
 
-The frontend should now be running, likely accessible via http://localhost:3000.
+The frontend runs on the Vite dev server, typically at http://localhost:5173.
