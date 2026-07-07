@@ -11,8 +11,8 @@ You can see a live demonstration of the system's functionality here:
 
 ## ✨ Features
 
-* **Multi-Agent AI Analysis:** A **CrewAI** pipeline of specialist agents (verifier → analyst → investment advisor → risk specialist → compiler) produces a financial summary, investment insights, and a risk matrix.
-* **Retrieval-Augmented Generation (RAG):** Documents are chunked, embedded, and indexed in **ChromaDB**; agents retrieve only the passages relevant to each question instead of stuffing whole PDFs into the prompt. Scales to large filings and keeps answers grounded in the source.
+* **Multi-Agent AI Analysis:** A **CrewAI** pipeline of specialist agents (verifier → analyst → investment advisor → risk specialist) produces a financial summary, investment insights, and a risk matrix. Their outputs are merged into the final report in **Python** — no extra LLM call.
+* **Retrieval-Augmented Generation (RAG):** Documents are chunked, embedded, and indexed in **ChromaDB**. The relevant passages are retrieved up front and injected into each agent's prompt (**retrieve-then-generate**), so every agent makes a single tool-free call. Scales to large filings and keeps answers grounded in the source.
 * **Local, free embeddings by default:** Embeddings run **offline** via ChromaDB's built-in MiniLM model — no API key or quota required. Swappable to Gemini embeddings via one env var.
 * **Swappable LLM provider:** Chat runs on **Groq** (generous free tier) or **Google Gemini**, selected with a single `LLM_MODEL` env variable — no code changes.
 * **Asynchronous Processing:** Utilizes **Celery** to offload long-running analysis tasks, keeping the API responsive; the frontend polls for completion.
@@ -88,10 +88,11 @@ Key settings in `.env`:
 
 | Variable | Purpose | Default |
 | :--- | :--- | :--- |
-| `LLM_MODEL` | Chat model. `groq/llama-3.3-70b-versatile` (recommended) or `gemini/gemini-2.5-flash`. | `gemini/gemini-2.5-flash` |
+| `LLM_MODEL` | Chat model. Groq: `groq/llama-3.1-8b-instant` (fast, larger daily quota) or `groq/llama-3.3-70b-versatile` (higher quality). Also `gemini/gemini-2.5-flash`. | `gemini/gemini-2.5-flash` |
 | `GROQ_API_KEY` | Required if `LLM_MODEL` is a `groq/*` model. Get one at [console.groq.com/keys](https://console.groq.com/keys). | — |
 | `GOOGLE_API_KEY` | Required only for Gemini chat **or** `EMBED_PROVIDER=gemini`. | — |
 | `EMBED_PROVIDER` | `local` (offline, free — no key needed) or `gemini`. | `local` |
+| `STEP_DELAY_SECONDS` | Pause between agent steps to stay under free-tier per-minute token limits. | `7` |
 | `JWT_SECRET_KEY` | Secret for signing auth tokens — use a long random string. | — |
 | `MONGO_URI`, `REDIS_URI` | Database + broker connections. | localhost |
 
@@ -100,9 +101,12 @@ Also set the frontend API URL in `finanalyzerUI/.env`:
 VITE_API_URL=http://localhost:8000
 ```
 
-> **Free-tier note:** Groq's free tier caps *tokens per minute*. If a large document
-> trips the limit, the pipeline auto-retries (`LLM_NUM_RETRIES`); just wait ~60s and
-> re-run if needed. Local embeddings avoid Gemini quota entirely.
+> **Free-tier note:** Groq caps tokens **per minute** *and* **per day**, and the daily
+> limit is **per model**. The pipeline keeps runs small (retrieve-then-generate + local
+> embeddings) and paces calls via `STEP_DELAY_SECONDS` to respect the per-minute cap. If
+> you exhaust one model's daily budget, switch `LLM_MODEL` to another Groq model for a
+> fresh bucket — e.g. `groq/llama-3.1-8b-instant` has a much larger daily allowance than
+> `groq/llama-3.3-70b-versatile`.
 
 > On the first analysis, `EMBED_PROVIDER=local` downloads a small (~80MB) embedding
 > model once and caches it — subsequent runs are instant.
