@@ -1,117 +1,99 @@
-## Importing libraries and files
-from crewai import Task
-from agents import financial_analyst, verifier, investment_advisor, risk_assessor, report_compiler
-from tools import read_financial_document, analyze_investment_tool, create_risk_assessment_tool
+"""
+Task graph for the Financial Document Analyzer crew (sequential process).
 
-# A task to help solve user's query
+Flow:  verify -> analyze -> invest -> risk   (final JSON assembled in Python, see
+celery_tasks.py — no LLM "compiler" call).
+
+Retrieve-then-generate RAG: the relevant passages are retrieved BEFORE the crew runs
+and injected into these prompts via kickoff inputs:
+  {doc_preview}        -> start of the document (for verification)
+  {financial_context}  -> passages about revenue/margins/cash flow/guidance
+  {risk_context}       -> passages about risks/litigation/debt/competition
+Each agent therefore makes a single tool-free LLM call.
+"""
+
+from crewai import Task
+
+from agents import financial_analyst, verifier, investment_advisor, risk_assessor
+
+# --- 1. Verification ----------------------------------------------------------
+verification_task = Task(
+    description=(
+        "Decide whether this is a genuine financial document (10-Q, 10-K, annual report, "
+        "earnings update, investor presentation) suitable for analysis.\n\n"
+        "Document excerpt:\n\"\"\"\n{doc_preview}\n\"\"\"\n\n"
+        "Return valid JSON only: verification_result, document_type, confidence, "
+        "reasoning, key_sections_found."
+    ),
+    expected_output=(
+        "JSON: {verification_result: 'valid'|'invalid', document_type, confidence (0-1), "
+        "reasoning, key_sections_found: [...]}"
+    ),
+    agent=verifier,
+    async_execution=False,
+)
+
+# --- 2. Financial analysis ----------------------------------------------------
 analyze_financial_document = Task(
     description=(
-        "1. Read and extract the content of the document stored at path {document_path}"
-        "2. Analyze the extracted financial data. Extract key figures, ratios, and insights. "
-        "3. Summarize revenue, profit, expenses, and growth trends."
-        "4. Answer the user query: {query}"
-        "5. Format your response as valid JSON with analysis_type, executive_summary, key_metrics, growth_trends, risks, and recommendations"
+        "Analyse the financial document using the excerpts below.\n"
+        "1. Extract concrete figures, ratios, and growth trends (revenue, profit, margins, "
+        "expenses, cash flow, guidance).\n"
+        "2. Answer the user's query: {query}\n"
+        "3. If verification marked the document invalid, say so in executive_summary and "
+        "keep other fields minimal.\n\n"
+        "Relevant financial excerpts:\n\"\"\"\n{financial_context}\n\"\"\"\n\n"
+        "Return valid JSON only with: analysis_type, executive_summary, key_metrics, "
+        "growth_trends, risks, recommendations."
     ),
     expected_output=(
-        "A structured JSON report including:\n"
-        "- analysis_type: 'financial_analysis'\n"
-        "- executive_summary: Brief overview\n"
-        "- key_metrics: Financial figures\n"
-        "- growth_trends: Growth indicators\n"
-        "- risks: Identified risks\n"
-        "- recommendations: Action items"
+        "JSON: {analysis_type: 'financial_analysis', executive_summary, key_metrics: {...}, "
+        "growth_trends: {...}, risks: [...], recommendations: [...]}"
     ),
     agent=financial_analyst,
-    tools=[read_financial_document, analyze_investment_tool],
+    context=[verification_task],
     async_execution=False,
 )
 
-# An investment analysis task
+# --- 3. Investment recommendations --------------------------------------------
 investment_analysis = Task(
     description=(
-        "1. Use the read_financial_document tool to get the document content stored at path {document_path}"
-        "2. Based on the financial analysis, provide compliant investment recommendations. "
-        "3. Focus on asset classes, sectors, or general strategies rather than stock tips."
-        "4. Format your response as valid JSON with recommendation_type, investment_themes, asset_allocation, risk_assessment, time_horizon, and disclaimer"
+        "Using the financial analysis from the previous step, provide compliant investment "
+        "recommendations. Focus on asset classes, sectors, and general strategies rather "
+        "than individual stock tips.\n"
+        "Return valid JSON only with: recommendation_type, investment_themes, "
+        "asset_allocation, risk_assessment, time_horizon, disclaimer."
     ),
     expected_output=(
-        "JSON recommendations including:\n"
-        "- recommendation_type: 'investment_advice'\n"
-        "- investment_themes: List of themes\n"
-        "- asset_allocation: Portfolio suggestions\n"
-        "- risk_assessment: Risk evaluation\n"
-        "- time_horizon: Investment timeline\n"
-        "- disclaimer: Legal disclaimer"
+        "JSON: {recommendation_type: 'investment_advice', investment_themes: [...], "
+        "asset_allocation: {...}, risk_assessment, time_horizon, disclaimer}"
     ),
     agent=investment_advisor,
-    tools=[read_financial_document, analyze_investment_tool],
+    context=[analyze_financial_document],
     async_execution=False,
 )
 
-# A risk assessment task
+# --- 4. Risk assessment -------------------------------------------------------
 risk_assessment = Task(
     description=(
-        "1. Read and extract the content of the document stored at path {document_path}"
-        "2. Identify financial and market risks mentioned in the document. "
-        "3. Highlight vulnerabilities and propose mitigation strategies."
-        "4. Provide a concise JSON ONLY response in exactly this schema with no extra fields:\n"
+        "Identify financial, market, and operational risks using the excerpts below. "
+        "Highlight vulnerabilities and propose mitigations.\n\n"
+        "Relevant risk-related excerpts:\n\"\"\"\n{risk_context}\n\"\"\"\n\n"
+        "Return valid JSON ONLY in exactly this schema (no extra fields):\n"
         "{\n"
         '  "assessment_type": "risk_analysis",\n'
         '  "identified_risks": [\n'
-        "    {\n"
-        '      "risk": "…",\n'
-        '      "description": "…",\n'
-        '      "severity": "High|Medium|Low",\n'
-        '      "likelihood": "High|Medium|Low",\n'
-        '      "strategy": "…"\n'
-        "    }\n"
+        '    {"risk": "…", "description": "…", "severity": "High|Medium|Low", '
+        '"likelihood": "High|Medium|Low", "strategy": "…"}\n'
         "  ]\n"
         "}\n"
-        "Ensure valid JSON, no markdown fences, and avoid redundancy."
+        "Valid JSON, no markdown fences, no redundancy."
     ),
     expected_output=(
-        "JSON risk assessment including:\n"
-        "- assessment_type: 'risk_analysis'\n"
-        "- identified_risks: List of risks with description/severity/likelihood/stratergy\n"
+        "JSON: {assessment_type: 'risk_analysis', identified_risks: [{risk, description, "
+        "severity, likelihood, strategy}]}"
     ),
     agent=risk_assessor,
-    tools=[read_financial_document, create_risk_assessment_tool],
-    async_execution=False,
-)
-
-# A file verification task
-verification_task = Task(
-    description=(
-        "1. Read and extract the content of the document stored at path {document_path}"
-        "2. Verify whether the uploaded file is a valid financial document before analysis."
-        "3. Format your response as valid JSON with verification_result, document_type, confidence, reasoning, and key_sections_found"
-    ),
-    expected_output=(
-        "JSON validation result:\n"
-        "- verification_result: 'valid' or 'invalid'\n"
-        "- document_type: Type of financial document\n"
-        "- confidence: Confidence score (0.0-1.0)\n"
-        "- reasoning: Explanation of validation\n"
-        "- key_sections_found: List of identified sections"
-    ),
-    agent=verifier,
-    tools=[read_financial_document],
-    async_execution=False
-)
-
-# Final compiler task to combine all three analysis
-final_report = Task(
-    description=(
-        "Combine the prior tasks' outputs into one final JSON object ONLY. "
-        'The EXACT output schema: {"summary": <financial_analysis JSON or string>, '
-        '"investment_insights": <investment JSON>, '
-        '"risk_assessment": {"assessment_type":"risk_analysis","identified_risks":[...]}}'
-    ),
-    expected_output=(
-        '{"summary": {... or string}, "investment_insights": {...}, '
-        '"risk_assessment":{"assessment_type":"risk_analysis","identified_risks":[...]}}'
-    ),
-    agent=report_compiler,
-    context=[analyze_financial_document, investment_analysis, risk_assessment],
+    context=[analyze_financial_document],
     async_execution=False,
 )

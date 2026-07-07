@@ -1,180 +1,261 @@
+"""
+Document tooling for the Financial Document Analyzer.
+
+Two responsibilities:
+  1. Robust text extraction from financial PDFs (numbers/tables PRESERVED).
+  2. Retrieval-Augmented Generation: chunk -> embed (Gemini) -> ChromaDB -> similarity search, exposed to the agents as `search_financial_document`.
+
+Design notes
+------------
+* The old preprocessor deleted every "mostly numeric" line and every ALL-CAPS header. 
+  In a *financial* document that throws away exactly the data we need (revenue, margins, EPS, balance-sheet figures, section titles). 
+  The new cleaner only normalises whitespace/encoding and de-hyphenates line breaks.
+* Each document is extracted and embedded ONCE, then cached by (path, mtime).
+  Every agent queries the same vector store instead of re-parsing the PDF.
+"""
+
 import os
 import re
+import hashlib
+import logging
 import unicodedata
 import warnings
-import logging
 from collections import OrderedDict
+from typing import List
+
 from dotenv import load_dotenv
 from crewai.tools import tool
-from crewai_tools.tools.pdf_search_tool import pdf_search_tool
 import pdfplumber
 
 load_dotenv()
 
-# Suppress PDF parsing warnings
+# Suppress noisy pdfplumber warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pdfplumber")
 logging.getLogger("pdfplumber").setLevel(logging.ERROR)
+logger = logging.getLogger("finanalyzer.tools")
 
-# preprocess the financial text
+# --- Tunables -----------------------------------------------------------------
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "700"))
+CHUNK_OVERLAP = 100
+TOP_K = int(os.getenv("TOP_K", "3"))
+# Embeddings provider:
+#   "local"  -> ChromaDB's built-in MiniLM (offline, free, no API/quota)   [default]
+#   "gemini" -> Google embeddings (needs GOOGLE_API_KEY, uses free-tier quota)
+EMBED_PROVIDER = os.getenv("EMBED_PROVIDER", "local").lower()
+EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")  # only for gemini
+# Cap the full-text tool (used by the verifier) — kept small to conserve chat tokens.
+MAX_FULLTEXT_CHARS = int(os.getenv("MAX_FULLTEXT_CHARS", "4000"))
+
+
+# -----------------------------------------------------------------------------
+# Text extraction + light cleaning (numbers are KEPT)
+# -----------------------------------------------------------------------------
 def preprocess_financial_text(raw: str) -> str:
-    # 1) Unicode normalize
+    """Normalise text without discarding financial figures or table rows."""
+    # 1) Unicode normalise + strip BOM / normalise line endings
     txt = unicodedata.normalize("NFKC", raw)
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n").replace("﻿", "")
 
-    # 2) Normalize line endings and remove BOMs
-    txt = txt.replace("\r\n", "\n").replace("\r", "\n").replace("\ufeff", "")
-
-    # 3) Remove page markers / page numbers on their own line
-    txt = re.sub(r"(?mi)^\s*(page|p\.)\s*\d+\s*$", "", txt)
-
-    # 4) Remove ALL-CAPS headers and “letter-spaced caps” like 'F I N A N C I A L  S U M M A R Y'
-    def _is_all_caps_or_spaced(line: str) -> bool:
-        plain = re.sub(r"[^A-Za-z]", "", line)
-        spaced = re.sub(r"\s+", "", line)
-        return (
-            (len(plain) >= 3 and plain.isupper()) or
-            (len(spaced) >= 3 and spaced.isupper() and " " in line)
-        )
-
-    lines = [ln.strip() for ln in txt.split("\n")]
-    lines = [ln for ln in lines if ln and not _is_all_caps_or_spaced(ln)]
-
-    # 5) Drop lines that are mostly numeric/symbols (tables)
-    def _mostly_numeric(line: str) -> bool:
-        if len(line) < 3:
-            return True
-        digits = sum(ch.isdigit() for ch in line)
-        sym = sum(ch in "%$()[],:;+-/|" for ch in line)
-        ratio = (digits + sym) / max(1, len(line))
-        return ratio > 0.45
-
-    lines = [ln for ln in lines if not _mostly_numeric(ln)]
-
-    # 6) Rebuild text to do de-hyphenation across line breaks
-    txt = "\n".join(lines)
+    # 2) De-hyphenate words split across a line break: "reve-\nnue" -> "revenue"
     txt = re.sub(r"(\w)-\n(\w)", r"\1\2", txt)
 
-    # 7) Join soft-wrapped sentences: newline followed by lowercase/number becomes space
-    txt = re.sub(r"\n(?=[a-z0-9])", " ", txt)
-
-    # 8) Collapse whitespace
+    # 3) Collapse runs of spaces/tabs, trim trailing spaces per line
     txt = re.sub(r"[ \t]{2,}", " ", txt)
-    txt = re.sub(r"\n{2,}", "\n", txt).strip()
+    lines = [ln.rstrip() for ln in txt.split("\n")]
 
-    # 9) Deduplicate paragraphs while preserving order
-    paras = [p.strip() for p in txt.split("\n") if p.strip()]
-    deduped = list(OrderedDict((p, None) for p in paras).keys())
-    cleaned = "\n".join(deduped)
+    # 4) Drop blank lines and de-duplicate consecutive/repeated lines
+    #    (headers/footers repeat every page) while preserving order.
+    lines = [ln for ln in lines if ln.strip()]
+    deduped = list(OrderedDict((ln, None) for ln in lines).keys())
 
-    return cleaned
+    return "\n".join(deduped).strip()
 
 
-# -------- Tools --------
-
-@tool("read_financial_document")
-def read_financial_document(path: str) -> str:
-    """
-    Reads and preprocesses text from a financial PDF document locally.
-    Avoids PDFSearchTool to prevent APIStatusError.
-    """
+def _extract_text(path: str) -> str:
+    """Extract raw text from a PDF (or plain-text file) and clean it."""
     path = os.path.normpath(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"File not found: {path}")
 
-    # Extract text locally (no external API/tool)
-    text_chunks = []
+    chunks: List[str] = []
     if path.lower().endswith(".pdf"):
         try:
             with pdfplumber.open(path) as pdf:
                 for page_num, page in enumerate(pdf.pages, 1):
                     try:
-                        text = page.extract_text()
+                        text = page.extract_text() or ""
                         if text:
-                            text_chunks.append(text)
-                    except Exception as e:
-                        print(f"Warning: Could not extract text from page {page_num}: {e}")
+                            chunks.append(text)
+                    except Exception as e:  # keep going on a bad page
+                        logger.warning("Page %s extraction failed: %s", page_num, e)
                         continue
         except Exception as e:
-            raise Exception(f"Failed to open PDF file: {e}")
+            raise RuntimeError(f"Failed to open PDF file: {e}") from e
     else:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            text_chunks.append(f.read())
+            chunks.append(f.read())
 
-    raw_text = "\n".join(text_chunks)
-    
+    raw_text = "\n".join(chunks)
     if not raw_text.strip():
-        raise Exception("No text could be extracted from the document")
+        raise RuntimeError("No text could be extracted from the document")
 
-    print(f"Successfully extracted {len(raw_text)} characters from document")
-    
-    # Preprocess
     cleaned = preprocess_financial_text(raw_text)
-
-    print(f"Preprocessed extracted text has {len(raw_text)} characters before returning")
-
+    logger.info("Extracted %d chars -> %d cleaned chars", len(raw_text), len(cleaned))
     return cleaned
 
 
-# Investment analysis tool
-@tool("investment_analysis")
-def analyze_investment_tool(financial_document_data: str) -> str:
+# -----------------------------------------------------------------------------
+# RAG index (lazy-initialised so importing this module never needs a key)
+# -----------------------------------------------------------------------------
+_gemini_embeddings = None   # langchain GoogleGenerativeAIEmbeddings (gemini provider)
+_local_ef = None            # chromadb DefaultEmbeddingFunction (local provider)
+_splitter = None            # RecursiveCharacterTextSplitter
+_chroma_client = None       # in-process chromadb client
+_index_cache: dict = {}     # cache_key -> collection_name
+
+
+def _get_gemini_embeddings():
+    global _gemini_embeddings
+    if _gemini_embeddings is None:
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        _gemini_embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
+    return _gemini_embeddings
+
+
+def _get_local_ef():
+    """Lazy-load ChromaDB's built-in MiniLM ONNX model (downloads once, ~80MB)."""
+    global _local_ef
+    if _local_ef is None:
+        from chromadb.utils import embedding_functions
+        _local_ef = embedding_functions.DefaultEmbeddingFunction()
+    return _local_ef
+
+
+def _to_floats(vec):
+    """Coerce a (possibly numpy) vector to a plain list of Python floats."""
+    if hasattr(vec, "tolist"):
+        return vec.tolist()
+    return [float(x) for x in vec]
+
+
+def _embed_documents(texts):
+    if EMBED_PROVIDER == "local":
+        return [_to_floats(v) for v in _get_local_ef()(texts)]
+    return _get_gemini_embeddings().embed_documents(texts)
+
+
+def _embed_query(text):
+    if EMBED_PROVIDER == "local":
+        return _to_floats(_get_local_ef()([text])[0])
+    return _get_gemini_embeddings().embed_query(text)
+
+
+def _get_splitter():
+    global _splitter
+    if _splitter is None:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        _splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+    return _splitter
+
+
+def _get_chroma():
+    global _chroma_client
+    if _chroma_client is None:
+        import chromadb
+        # In-process, ephemeral store — rebuilt per worker. Enough for retrieval.
+        _chroma_client = chromadb.Client()
+    return _chroma_client
+
+
+def _cache_key(path: str) -> str:
+    """Stable key for a document's current bytes (path + mtime + size)."""
+    st = os.stat(path)
+    raw = f"{os.path.abspath(path)}::{int(st.st_mtime)}::{st.st_size}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:24]
+
+
+def _get_or_build_index(path: str) -> str:
+    """Return the Chroma collection name for `path`, building it on first use."""
+    path = os.path.normpath(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+
+    key = _cache_key(path)
+    if key in _index_cache:
+        return _index_cache[key]
+
+    text = _extract_text(path)
+    chunks = _get_splitter().split_text(text)
+    if not chunks:
+        raise RuntimeError("Document produced no chunks to index")
+
+    embeddings = _embed_documents(chunks)
+
+    collection_name = f"doc_{key}"
+    client = _get_chroma()
+    # Fresh collection (drop any stale one with the same name)
+    try:
+        client.delete_collection(collection_name)
+    except Exception:
+        pass
+    collection = client.create_collection(collection_name)
+    collection.add(
+        ids=[f"{key}_{i}" for i in range(len(chunks))],
+        documents=chunks,
+        embeddings=embeddings,
+    )
+
+    _index_cache[key] = collection_name
+    logger.info("Indexed %s into %d chunks", os.path.basename(path), len(chunks))
+    return collection_name
+
+
+# -----------------------------------------------------------------------------
+# Tools exposed to the agents
+# -----------------------------------------------------------------------------
+@tool("read_financial_document")
+def read_financial_document(document_path: str) -> str:
+    """Read and return the full cleaned text of a financial document.
+
+    Use this to get an overview of a document (e.g. to verify its type).
+    Numbers and tables are preserved. Very large documents are truncated to a
+    safe length — use `search_financial_document` for targeted retrieval.
+
+    Args:
+        document_path: Filesystem path to the PDF/text file.
     """
-    Analyzes financial document data for potential investment insights.
-    Extracts growth, profitability, and opportunity indicators.
+    text = _extract_text(document_path)
+    if len(text) > MAX_FULLTEXT_CHARS:
+        text = text[:MAX_FULLTEXT_CHARS] + "\n\n[... truncated; use search_financial_document for details ...]"
+    return text
+
+
+@tool("search_financial_document")
+def search_financial_document(document_path: str, query: str) -> str:
+    """Retrieve the passages of a financial document most relevant to a query.
+
+    Runs vector similarity search (Gemini embeddings + ChromaDB) over the
+    document and returns the top matching chunks. Prefer this over reading the
+    whole document — it is faster, cheaper, and scales to very large filings.
+
+    Args:
+        document_path: Filesystem path to the PDF/text file.
+        query: A focused question, e.g. "revenue and gross margin trend".
     """
     try:
-        # Very simple heuristic scan on cleaned text
-        text = financial_document_data.lower()
-
-        signals = {
-            "growth": ["growth", "increase", "expansion", "positive trend", "forecast"],
-            "profitability": ["profit", "margin", "revenue", "net income", "ebitda"],
-            "cash": ["cash flow", "free cash flow", "liquidity", "capital expenditures", "capex"],
-            "leverage": ["debt", "leverage", "liabilities", "interest expense"],
-            "outlook": ["guidance", "outlook", "expect", "plan", "target"],
-            "risk": ["decline", "loss", "uncertain", "volatility", "regulatory", "litigation"],
-        }
-
-        hits = []
-        for bucket, kws in signals.items():
-            found = [kw for kw in kws if kw in text]
-            if found:
-                hits.append(f"- {bucket.capitalize()}: {', '.join(found)}")
-
-        summary = "No strong textual signals found." if not hits else "Signals:\n" + "\n".join(hits)
-
-        # Include a short preview to aid debugging
-        preview = text[:1200] + ("..." if len(text) > 1200 else "")
-        return f"Preprocessed text length: {len(text)} chars\n\n{summary}\n\n---\nPreview:\n{preview}"
-
+        collection_name = _get_or_build_index(document_path)
+        collection = _get_chroma().get_collection(collection_name)
+        q_emb = _embed_query(query)
+        res = collection.query(query_embeddings=[q_emb], n_results=TOP_K)
+        docs = (res.get("documents") or [[]])[0]
+        if not docs:
+            return "No relevant passages found in the document."
+        return "\n\n---\n\n".join(docs)
     except Exception as e:
-        # Never propagate to avoid 500 in /analyses; return diagnostic text instead
-        return f"Analyzer error: {type(e).__name__}: {e}"
-
-
-# Risk assessment tool
-@tool("risk_assessment")
-def create_risk_assessment_tool(financial_document_data: str) -> str:
-    """
-    Performs a basic risk assessment on financial documents.
-    Identifies red flags like debt, volatility, losses, litigation, etc.
-    """
-    text = financial_document_data.lower()
-
-    risks = {
-        "debt": ["debt", "liabilities", "borrowings"],
-        "volatility": ["volatile", "uncertain", "instability", "fluctuations"],
-        "losses": ["loss", "negative cash flow", "decline"],
-        "litigation": ["lawsuit", "legal", "regulatory", "penalty", "compliance"],
-    }
-
-    red_flags = []
-    for risk_area, keywords in risks.items():
-        matches = [kw for kw in keywords if kw in text]
-        if matches:
-            red_flags.append(f"- {risk_area.capitalize()} concerns: {', '.join(matches)}")
-
-    if not red_flags:
-        return "No major risk concerns identified."
-
-    return "Risk Assessment:\n" + "\n".join(red_flags)
-
+        # Fail soft: agents should still be able to fall back to full text.
+        logger.exception("search_financial_document failed")
+        return f"Retrieval error: {type(e).__name__}: {e}"

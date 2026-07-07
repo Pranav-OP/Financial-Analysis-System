@@ -1,184 +1,128 @@
-# --- Importing libraries and files ---
+"""
+Agent definitions for the Financial Document Analyzer crew.
+
+Design: retrieve-then-generate RAG.
+Relevant passages are retrieved up front (see celery_tasks / tools.py) and injected
+into each task's prompt, so every agent makes ONE clean LLM call with NO tools. This
+is ~2x fewer calls than agentic tool-calling (faster + far fewer tokens, which matters
+on free-tier per-minute limits) and avoids the ReAct tool loop that made some models
+emit truncated / non-JSON output.
+
+The LLM is wired through CrewAI's native `LLM` abstraction (LiteLLM under the hood);
+the provider is chosen by the LLM_MODEL env var (Groq by default).
+"""
+
 import os
 from dotenv import load_dotenv
-from crewai import Agent
-from tools import (
-    read_financial_document,
-    analyze_investment_tool,
-    create_risk_assessment_tool,
-)
+
+from crewai import Agent, LLM
 
 load_dotenv()
 
-# --- Import and initialize LLM with LiteLLM ---
-from litellm import completion
+# --- LLM provider selection (env-driven, one-line swap) -----------------------
+# Chat model examples:
+#   groq/llama-3.3-70b-versatile   (Groq — generous free tier, recommended)
+#   gemini/gemini-2.5-flash        (Google — free tier only ~5 req/min)
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini/gemini-2.5-flash")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
 
-# Set up environment variable for Gemini
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-os.environ["GEMINI_API_KEY"] = GOOGLE_API_KEY
+# RAG embeddings (tools.py) default to a local model; a Google key is only needed for
+# gemini chat or EMBED_PROVIDER=gemini. LiteLLM reads GEMINI_API_KEY for gemini/* models.
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+if GOOGLE_API_KEY:
+    os.environ["GEMINI_API_KEY"] = GOOGLE_API_KEY
 
-if not GOOGLE_API_KEY:
-    raise ValueError("Google API key not found in environment variables")
+llm_kwargs = {
+    "model": LLM_MODEL,
+    "temperature": LLM_TEMPERATURE,
+    "num_retries": int(os.getenv("LLM_NUM_RETRIES", "3")),
+}
 
-# from crewai import LLM
-# llm = LLM(
-#     model="gemini/gemini-2.0-flash",
-#     temperature=0.3
-# )
+if LLM_MODEL.startswith("groq/"):
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        raise ValueError("LLM_MODEL is a Groq model but GROQ_API_KEY is not set in .env")
+    llm_kwargs["api_key"] = groq_key
+elif LLM_MODEL.startswith("gemini/") and not GOOGLE_API_KEY:
+    raise ValueError("LLM_MODEL is a Gemini model but GOOGLE_API_KEY is not set in .env")
 
-# Create a LiteLLM wrapper class for CrewAI compatibility
-class LiteLLMWrapper:
-    def __init__(self, model_name, temperature=0.3):
-        self.model_name = model_name
-        self.temperature = temperature
-    
-    def __call__(self, messages, **kwargs):
-        try:
-            response = completion(
-                model=self.model_name,
-                messages=messages,
-                temperature=kwargs.get('temperature', self.temperature),
-                **kwargs
-            )
-            return response
-        except Exception as e:
-            print(f"LiteLLM Error: {e}")
-            raise e
-    
-    def invoke(self, prompt, **kwargs):
-        """Alternative method for compatibility"""
-        messages = [{"role": "user", "content": prompt}]
-        return self.__call__(messages, **kwargs)
+llm = LLM(**llm_kwargs)
 
-# Create the LLM instance with correct model format
-llm = LiteLLMWrapper(
-    model_name="gemini/gemini-2.0-flash", 
-    #model_name="gemini/gemini-2.5-pro", 
-    temperature=0.3
-)
-
-# Verify LLM is properly initialized
-if llm is None:
-    raise ValueError("An LLM instance must be provided to create agents.")
-
-# --- Agent Definitions ---
+# --- Agent Definitions --------------------------------------------------------
+# No tools + max_iter=1: each agent produces its JSON answer in a single call from the
+# retrieved context injected into the task prompt.
 
 financial_analyst = Agent(
     role="Senior Financial Analyst",
-    goal="Provide accurate, compliant, and data-driven analysis of financial documents and market trends.",
+    goal="Provide accurate, compliant, data-driven analysis grounded in the provided financial excerpts.",
     backstory=(
-        "The document is stored at path {document_path}"
-        "You are an experienced financial analyst specializing in corporate earnings, macroeconomic indicators,"
-        "and investment trends. You carefully read reports, extract key financial ratios, assess performance,"
-        "and provide professional, compliant insights based on relevant financial data found in document."
-        "You ALWAYS format your final analysis as valid JSON with the following structure: "
-        "{'analysis_type': 'financial_analysis', 'executive_summary': '...', 'key_metrics': {...}, "
-        "'growth_trends': {...}, 'risks': [...], 'recommendations': [...]}"
+        "You are an experienced financial analyst specializing in corporate earnings, "
+        "macroeconomic indicators, and investment trends. You extract concrete figures and "
+        "ratios from the provided document excerpts, assess performance with professional, "
+        "compliant judgement, and never fabricate numbers that are not in the excerpts."
+        "\n\nYou ALWAYS return valid JSON (no markdown fences) with this exact structure: "
+        '{"analysis_type": "financial_analysis", "executive_summary": "...", '
+        '"key_metrics": {...}, "growth_trends": {...}, "risks": [...], "recommendations": [...]}'
     ),
-    tools=[read_financial_document, analyze_investment_tool, create_risk_assessment_tool],
     llm=llm,
     max_iter=1,
-    max_rpm=10,
     verbose=True,
-    allow_delegation=False
+    allow_delegation=False,
 )
 
 
 verifier = Agent(
     role="Financial Document Verifier",
-    goal="Validate that uploaded files are genuine financial documents and suitable for analysis.",
-    verbose=True,
+    goal="Determine whether the provided document excerpt is a genuine financial document worth analysing.",
     backstory=(
-        "Input parameter for the document is {document_path}"
-        "You are responsible for verifying document integrity and its type. "
-        "Your task is to ensure uploaded documents are relevant financial files "
-        "Categorize the given document as either financial or non-financial documents"
-        "(e.g., 10-Q, annual reports, investor presentations) and reject irrelevant ones."
-        "You ALWAYS return your verification result as valid JSON with this structure: "
-        "{'verification_result': 'valid'|'invalid', 'document_type': '...', 'confidence': 0.0-1.0, "
-        "'reasoning': '...', 'key_sections_found': [...]}"
+        "You verify document integrity and type. From the provided excerpt, categorize the "
+        "document as financial (10-Q, 10-K, annual report, earnings update, investor "
+        "presentation) or non-financial, and reject irrelevant files."
+        "\n\nYou ALWAYS return valid JSON (no markdown fences) with this exact structure: "
+        '{"verification_result": "valid"|"invalid", "document_type": "...", '
+        '"confidence": 0.0-1.0, "reasoning": "...", "key_sections_found": [...]}'
     ),
-    tools=[read_financial_document],
     llm=llm,
     max_iter=1,
-    max_rpm=10,
-    allow_delegation=True
+    verbose=True,
+    allow_delegation=False,
 )
 
 
 investment_advisor = Agent(
     role="Investment Advisor",
-    goal="Recommend compliant, balanced, and risk-adjusted investment strategies based on analysis.",
-    verbose=True,
+    goal="Recommend compliant, balanced, risk-adjusted investment strategies based on the analysis.",
     backstory=(
-        "You are a seasoned investment advisor with knowledge of asset allocation, "
-        "risk-return trade-offs, and portfolio management. Your recommendations are "
-        "grounded in the analysis results and follow regulatory best practices."
-        "You ALWAYS format your recommendations as valid JSON with this structure: "
-        "{'recommendation_type': 'investment_advice', 'investment_themes': [...], "
-        "'asset_allocation': {...}, 'risk_assessment': '...', 'time_horizon': '...', "
-        "'disclaimer': '...'}"
+        "You are a seasoned investment advisor versed in asset allocation, risk-return "
+        "trade-offs, and portfolio management. Ground recommendations in the financial "
+        "analysis provided and regulatory best practice. Favor asset classes/sectors/"
+        "strategies over individual stock tips."
+        "\n\nYou ALWAYS return valid JSON (no markdown fences) with this exact structure: "
+        '{"recommendation_type": "investment_advice", "investment_themes": [...], '
+        '"asset_allocation": {...}, "risk_assessment": "...", "time_horizon": "...", '
+        '"disclaimer": "..."}'
     ),
-    tools=[analyze_investment_tool],
     llm=llm,
     max_iter=1,
-    max_rpm=10,
-    allow_delegation=False
+    verbose=True,
+    allow_delegation=False,
 )
 
 
 risk_assessor = Agent(
     role="Risk Management Specialist",
-    goal="Identify financial, market, and operational risks from documents and provide mitigation strategies.",
+    goal="Identify financial, market, and operational risks and propose mitigations.",
+    backstory=(
+        "You are an expert in credit, liquidity, market, and operational risk. From the "
+        "provided excerpts, highlight realistic risks and suggest concrete mitigation "
+        "approaches. Do not invent risks the excerpts do not support."
+        "\n\nYou ALWAYS return valid JSON (no markdown fences) with this exact structure: "
+        '{"assessment_type": "risk_analysis", "identified_risks": [...], "risk_matrix": {...}, '
+        '"mitigation_strategies": [...], "overall_risk_rating": "...", '
+        '"monitoring_recommendations": [...]}'
+    ),
+    llm=llm,
+    max_iter=1,
     verbose=True,
-    backstory=(
-        "You are an expert in financial risk management, focusing on credit, liquidity, "
-        "market, and operational risks. Your task is to highlight realistic risks in "
-        "the analyzed documents and suggest mitigation approaches."
-        "You ALWAYS format your risk assessment as valid JSON with this structure: "
-        "{'assessment_type': 'risk_analysis', 'identified_risks': [...], 'risk_matrix': {...}, "
-        "'mitigation_strategies': [...], 'overall_risk_rating': '...', 'monitoring_recommendations': [...]}"
-    ),
-    tools=[create_risk_assessment_tool],
-    llm=llm,
-    max_iter=1,
-    max_rpm=10,
-    allow_delegation=False
-)
-
-
-document_processor = Agent(
-    role="Document Processing Specialist",
-    goal="Handle file processing, path resolution, and ensure documents are accessible to other agents. Always return output in valid JSON format.",
-    verbose=True,
-    backstory=(
-        "Input parameter for the document is {document_path}"
-        "You are responsible for processing uploaded documents and ensuring they are "
-        "properly accessible to other agents. You handle file path resolution, "
-        "document format validation, and initial content extraction. "
-        "You ALWAYS return processing results as valid JSON with this structure: "
-        "{'processing_status': 'success'|'failure', 'file_path': '...', 'document_content': '...', "
-        "'file_size': 0, 'pages': 0, 'error_message': null}"
-    ),
-    tools=[read_financial_document],
-    llm=llm,
-    max_iter=1,
-    max_rpm=10,
-    allow_delegation=False
-)
-
-
-report_compiler = Agent(
-    role="Report Compiler",
-    goal="Combine prior agents' outputs into one final JSON object with summary, investment insights, and risk assessment.",
-    backstory=(
-        "You consolidate the outputs from Financial Analyst, Investment Advisor, and Risk Specialist. "
-        "You must output a single valid JSON with exactly these keys: "
-        '{"summary": {... or string}, "investment_insights": {...}, "risk_assessment": {"assessment_type":"risk_analysis","identified_risks":[...]}} '
-        "No markdown fences, no extra text."
-    ),
-    llm=llm,
-    max_iter=1,
-    max_rpm=10,
-    allow_delegation=False
+    allow_delegation=False,
 )
