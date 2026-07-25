@@ -1,0 +1,13 @@
+# Keep the backend build context small and secret-free
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+finanalyzerUI/
+docs/
+*.md
+data/*_*.pdf
+.vscode/
+.idea/

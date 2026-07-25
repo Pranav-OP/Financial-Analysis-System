@@ -1,0 +1,77 @@
+# One command to run the whole stack:  docker compose up --build
+#
+# Services: mongo, redis, backend (FastAPI), worker (Celery), frontend (nginx).
+# Secrets (GROQ_API_KEY, JWT_SECRET_KEY, …) are read from your local .env file.
+# MONGO_URI / REDIS_URI are overridden here to point at the container service names.
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    image: finanalyzer-api:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URI: redis://redis:6379
+      EMBED_PROVIDER: local
+    ports:
+      - "8000:8000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    image: finanalyzer-api:local
+    restart: unless-stopped
+    command: celery -A celery_app worker --loglevel=info --pool=solo
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_URI: redis://redis:6379
+      EMBED_PROVIDER: local
+    volumes:
+      # Persist the ~80 MB local embedding model so it downloads only once.
+      - chroma_cache:/root/.cache/chroma
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./finanalyzerUI
+      args:
+        VITE_API_URL: http://localhost:8000
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:
+  chroma_cache:
