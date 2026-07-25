@@ -46,9 +46,29 @@ This project is built using a modern, decoupled architecture:
 
 ---
 
-## 🛠️ Installation and Running
+## 🐳 Quick start with Docker (recommended)
 
-Follow these steps to get the Financial Analysis System up and running.
+The whole stack — MongoDB, Redis, the API, the Celery worker, and the frontend — runs
+with **one command**. You only need [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+installed (no local Python, Node, Redis, or Mongo setup).
+
+```bash
+cp .env.example .env      # then add your GROQ_API_KEY (and a JWT_SECRET_KEY)
+docker compose up --build
+```
+
+Then open **http://localhost:5173**. The API is at **http://localhost:8000** (`/docs` for
+Swagger). First build takes a few minutes; the ~80 MB local embedding model downloads
+once and is cached in a volume. Stop with `Ctrl+C`; wipe all data with `docker compose down -v`.
+
+> On Windows, Docker Desktop uses the WSL2 backend under the hood — so Redis/Mongo run in
+> containers automatically and you never start WSL or those services by hand.
+
+---
+
+## 🛠️ Manual setup (without Docker)
+
+Follow these steps to run each piece yourself.
 
 ### Step 1: Clone the Repository
 

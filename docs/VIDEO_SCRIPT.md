@@ -20,6 +20,17 @@ put on screen) and **"spoken"** lines you can read aloud or paraphrase. Target l
 
 ---
 
+## 0.5 Running it (optional, 15–20s)
+
+**[SHOW]** A terminal running `docker compose up`, then the browser opening
+`http://localhost:5173`.
+
+> "The whole thing runs with a single command — `docker compose up`. That spins up five
+> containers: the database, the message broker, the API, the background worker, and the
+> frontend. No manual setup. Let me open it in the browser."
+
+---
+
 ## 1. The live demo (60–90s)
 
 **[SHOW]** Log in → upload the Tesla PDF → set a query → click **Analyze**.
@@ -73,7 +84,8 @@ while it processes.
 >
 > The frontend then **polls** a status endpoint every few seconds until the job is done.
 > This keeps the UI responsive and lets the heavy AI work scale independently of the web
-> server."
+> server. And because everything is containerized, the API and the worker each run as
+> their own service — exactly how you'd scale them in production."
 
 ---
 
